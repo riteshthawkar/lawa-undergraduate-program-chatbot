@@ -5,19 +5,30 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
+from langchain_huggingface import HuggingFaceEmbeddings
 
 # Import modules
 from modules.config import logger, validate_env_vars, system_prompt
 from modules.schemas import ChatRequest, CitationSource
 from modules.utils import safe_send, format_query
 from modules.citations import process_citations
-from modules.retrieval import initialize_pinecone, rerank_docs, tavily_search
+from modules.retrieval import initialize_pinecone_with_embeddings, rerank_docs, tavily_search
 from modules.query_rewriting import query_rewriting_agent, openai_client
 
 # ------------------------------------------------------------------------------
 # Initialize application and validate environment
 # ------------------------------------------------------------------------------
 validate_env_vars()
+
+# ------------------------------------------------------------------------------
+# Initialize embedding model globally
+# ------------------------------------------------------------------------------
+logger.info("Initializing embedding model globally...")
+embed_model = HuggingFaceEmbeddings(
+    model_name="Snowflake/snowflake-arctic-embed-l-v2.0",
+    model_kwargs={"trust_remote_code": True}
+)
+logger.info("Embedding model initialized successfully")
 
 # ------------------------------------------------------------------------------
 # Initialize FastAPI app with CORS middleware (restrict origins in production)
@@ -32,9 +43,9 @@ app.add_middleware(
 )
 
 # ------------------------------------------------------------------------------
-# Initialize Pinecone retriever and client
+# Initialize Pinecone retriever and client using global embedding model
 # ------------------------------------------------------------------------------
-retriever, pc = initialize_pinecone()
+retriever, pc = initialize_pinecone_with_embeddings(embed_model)
 
 # ------------------------------------------------------------------------------
 # WebSocket endpoint for chat functionality with improved error handling
@@ -375,4 +386,35 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return JSONResponse(content={"message": "working"})
+    try:
+        # Check if embedding model is loaded
+        if embed_model is None:
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": "Embedding model not initialized"}
+            )
+        
+        # Check if Pinecone client is connected
+        if pc is None:
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": "Pinecone client not initialized"}
+            )
+            
+        # Return success if all checks pass
+        return JSONResponse(
+            content={
+                "status": "healthy",
+                "message": "API is operational",
+                "components": {
+                    "embedding_model": "initialized",
+                    "pinecone": "connected"
+                }
+            }
+        )
+    except Exception as e:
+        logger.exception("Health check failed:")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)}
+        )

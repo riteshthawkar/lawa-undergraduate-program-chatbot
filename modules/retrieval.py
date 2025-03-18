@@ -45,6 +45,31 @@ def initialize_pinecone():
                 raise
             time.sleep(2 ** attempt)
 
+def initialize_pinecone_with_embeddings(embed_model):
+    """Initialize the Pinecone retriever with a pre-initialized embedding model"""
+    pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+    for attempt in range(MAX_RETRIES):
+        try:
+            index = pc.Index(PINECONE_INDEX)
+            bm25 = BM25Encoder().load(BM25_FILE)
+            
+            return (
+                PineconeHybridSearchRetriever(
+                    embeddings=embed_model,
+                    sparse_encoder=bm25,
+                    index=index,
+                    top_k=40,  # Hardcoded as required
+                    alpha=0.6,  # Hardcoded as required
+                ),
+                pc
+            )
+        except Exception as e:
+            logger.warning(f"Pinecone initialization attempt {attempt + 1} failed: {e}")
+            if attempt == MAX_RETRIES - 1:
+                logger.exception("Failed to initialize Pinecone after multiple attempts.")
+                raise
+            time.sleep(2 ** attempt)
+
 def rerank_docs(query: str, docs: List[dict], pc_client: Pinecone) -> List[dict]:
     """Reranks documents using Pinecone reranking"""
     try:
