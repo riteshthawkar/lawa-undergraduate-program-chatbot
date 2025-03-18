@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+pydantic
+python-dotenv
+openai
+pinecone
+pinecone-text
+langchain-community
+langchain-huggingface
+httpx
+asyncio
+transformers
+sentence-transformers
+uvicorn[standard]
