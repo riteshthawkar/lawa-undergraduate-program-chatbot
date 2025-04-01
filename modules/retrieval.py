@@ -12,7 +12,7 @@ from modules.config import logger
 
 # Initialize retrieval components
 MAX_RETRIES = 3
-PINECONE_INDEX = "mbzuai-site-index"
+PINECONE_INDEX = "final-mbzuai-index"
 BM25_FILE = "./MBZUAI_BM25_ENCODER.json"
 
 def initialize_pinecone():
