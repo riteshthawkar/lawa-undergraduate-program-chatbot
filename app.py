@@ -74,8 +74,8 @@ async def websocket_endpoint(websocket: WebSocket):
             # Apply query rewriting agent to analyze and possibly rewrite the query
             agent_result = await query_rewriting_agent(question, language, previous_chats)
             
-            # Handle direct responses (out of scope or clarification requests)
-            if agent_result["action"] in ["respond", "clarify"]:
+            # Handle direct responses (out of scope or identity queries)
+            if agent_result["action"] == "respond":
                 await safe_send(websocket, {"response": agent_result["response"], "sources": []})
                 continue
                 
@@ -242,8 +242,8 @@ async def telegram_chat(chat_request: ChatRequest):
     # Apply query rewriting agent to analyze and possibly rewrite the query
     agent_result = await query_rewriting_agent(question, language, previous_chats)
     
-    # Handle direct responses (out of scope or clarification requests)
-    if agent_result["action"] in ["respond", "clarify"]:
+    # Handle direct responses (out of scope or identity queries)
+    if agent_result["action"] == "respond":
         return {
             "response": agent_result["response"],
             "sources": []
