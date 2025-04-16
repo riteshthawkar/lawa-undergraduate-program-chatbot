@@ -51,8 +51,10 @@ def process_citations(complete_answer: str, ranked_docs: List[dict]) -> Tuple[st
             # URL encode each component separately
             encoded_path = urllib.parse.quote(parsed_url.path, safe='/,')
             encoded_query = urllib.parse.quote_plus(parsed_url.query, safe='&=')
-            encoded_fragment = urllib.parse.quote(parsed_url.fragment)
-            
+            # Fix: Only encode spaces and unsafe characters in fragment, but do NOT encode '='
+            # This preserves fragments like 'page=10' as-is
+            encoded_fragment = urllib.parse.quote(parsed_url.fragment, safe='=')
+
             # Reconstruct the URL with encoded components
             encoded_url = urllib.parse.urlunparse((
                 parsed_url.scheme,
