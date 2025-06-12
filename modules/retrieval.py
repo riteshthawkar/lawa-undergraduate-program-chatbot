@@ -12,8 +12,10 @@ from modules.config import logger
 
 # Initialize retrieval components
 MAX_RETRIES = 3
-PINECONE_INDEX = "final-mbzuai-index"
+PINECONE_INDEX = "mbzuai-webpages-index-latest"
 BM25_FILE = "./MBZUAI_BM25_ENCODER.json"
+PINECONE_WEBPAGES_INDEX = "mbzuai-webpages-index-latest" # Define missing constant
+PINECONE_PDFS_INDEX = "mbzuai-pdfs-index-latest"       # Define missing constant
 
 def initialize_pinecone():
     """Initialize the Pinecone retriever with retries"""

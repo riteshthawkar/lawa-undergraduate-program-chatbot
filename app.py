@@ -34,7 +34,7 @@ validate_env_vars()
 # ------------------------------------------------------------------------------
 logger.info("Initializing embedding model globally...")
 embed_model = HuggingFaceEmbeddings(
-    model_name="Snowflake/snowflake-arctic-embed-l-v2.0",
+    model_name="Qwen/Qwen3-Embedding-0.6B",
     model_kwargs={"trust_remote_code": True}
 )
 logger.info("Embedding model initialized successfully")
