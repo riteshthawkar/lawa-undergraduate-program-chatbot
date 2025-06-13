@@ -12,7 +12,7 @@ from pydantic import ValidationError
 from langchain_huggingface import HuggingFaceEmbeddings
 
 # Import modules
-from modules.config import logger, validate_env_vars, system_prompt
+from modules.config import logger, validate_env_vars, get_system_prompt
 from modules.schemas import ChatRequest, CitationSource
 from modules.utils import safe_send, format_query
 from modules.citations import process_citations
@@ -208,7 +208,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 ranked_docs = docs
 
             # Prepare the conversation messages
-            messages = [{"role": "system", "content": system_prompt}]
+            messages = [{"role": "system", "content": get_system_prompt()}]
             messages.extend(relevant_history)  # Use only the relevant history
             messages.append({"role": "user", "content": format_query(question, language, ranked_docs)})
 
@@ -429,7 +429,7 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
         ranked_docs = docs
 
     # Prepare the conversation messages.
-    messages = [{"role": "system", "content": system_prompt}]
+    messages = [{"role": "system", "content": get_system_prompt()}]
     messages.extend(relevant_history)  # Use only the relevant history
     messages.append({"role": "user", "content": format_query(question, language, ranked_docs)})
 
