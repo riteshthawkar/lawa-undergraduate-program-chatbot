@@ -23,6 +23,9 @@ required_env_vars = [
     "OPENAI_API_KEY"
 ]
 
+# Get RAG App Name from environment variables
+RAG_APP_NAME = os.getenv("RAG_APP_NAME", "default_rag_app")
+
 # Validate required environment variables
 def validate_env_vars():
     missing_vars = [var for var in required_env_vars if not os.getenv(var)]

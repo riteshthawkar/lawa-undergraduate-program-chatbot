@@ -3,6 +3,7 @@ import re
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,15 +13,15 @@ from pydantic import ValidationError
 from langchain_huggingface import HuggingFaceEmbeddings
 
 # Import modules
-from modules.config import logger, validate_env_vars, get_system_prompt
+from modules.config import logger, validate_env_vars, get_system_prompt, RAG_APP_NAME
 from modules.schemas import ChatRequest, CitationSource
 from modules.utils import safe_send, format_query
 from modules.citations import process_citations
-from modules.retrieval import initialize_pinecone_with_embeddings, rerank_docs, tavily_search
+from modules.retrieval import initialize_pinecone_with_embeddings, rerank_docs, tavily_search, fetch_balanced_documents
 from modules.query_rewriting import query_rewriting_agent, openai_client
 
 # Import database modules
-from modules.database.database import init_db
+from modules.database.database import init_db, connect_db, disconnect_db
 from modules.database.repository import ChatRepository
 from modules.database.views import router as history_router
 
@@ -37,12 +38,41 @@ embed_model = HuggingFaceEmbeddings(
     model_name="Qwen/Qwen3-Embedding-0.6B",
     model_kwargs={"trust_remote_code": True}
 )
+
 logger.info("Embedding model initialized successfully")
 
 # ------------------------------------------------------------------------------
-# Initialize FastAPI app with CORS middleware (restrict origins in production)
+# Lifespan manager for database connection pool
 # ------------------------------------------------------------------------------
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Connect to DB and initialize
+    logger.info("Application startup: Connecting to database...")
+    # Call connect_db and store the returned pool
+    pool = await connect_db()
+    logger.info("Application startup: Initializing database schema...")
+    # Pass the created pool to init_db
+    await init_db(pool)
+
+    # Assign the pool to app state
+    if pool:
+        app.state.pool = pool
+        logger.info(f"Database pool assigned to app.state. Pool state: {app.state.pool}")
+    else:
+        logger.error("connect_db returned None. Cannot assign pool to app.state.")
+        app.state.pool = None # Explicitly set to None if import failed
+
+    yield # Application runs here
+
+    # Shutdown: Disconnect from DB
+    logger.info("Application shutdown: Disconnecting from database...")
+    # Pass the pool from app state to disconnect_db
+    await disconnect_db(app.state.pool)
+
+# ------------------------------------------------------------------------------
+# Initialize FastAPI app with CORS middleware and lifespan manager
+# ------------------------------------------------------------------------------
+app = FastAPI(lifespan=lifespan)
 
 # CORS configuration with specific origins for better security
 app.add_middleware(
@@ -62,19 +92,22 @@ base_dir = os.path.dirname(os.path.abspath(__file__))
 # ------------------------------------------------------------------------------
 # Initialize Pinecone retriever and client using global embedding model
 # ------------------------------------------------------------------------------
-retriever, pc = initialize_pinecone_with_embeddings(embed_model)
+logger.info("Initializing Pinecone with pre-loaded embedding model...")
+# Retriever is now initialized on-the-fly in fetch_balanced_documents
+# initialize_pinecone_with_embeddings now returns bm25, pc, async_pc
+bm25_encoder, pc, async_pc = initialize_pinecone_with_embeddings(embed_model)
+logger.info("Pinecone components (bm25_encoder, pc, async_pc) initialized successfully.")
 
 # ------------------------------------------------------------------------------
-# Initialize database and include database router
+# Include database history router (endpoints within will need async updates too)
 # ------------------------------------------------------------------------------
-init_db()
 app.include_router(history_router, prefix="/api")
 
 # ------------------------------------------------------------------------------
 # WebSocket endpoint for chat functionality with improved error handling
 # ------------------------------------------------------------------------------
 @app.websocket("/chat")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket, background_tasks: BackgroundTasks):
     await websocket.accept()
     logger.info("New client connected")
     
@@ -83,25 +116,34 @@ async def websocket_endpoint(websocket: WebSocket):
             # Wait for client messages without a timeout
             data = await websocket.receive_json()
             
-            try:
-                # Check if this is a feedback update
-                if "feedback" in data and "id" in data:
-                    # Convert chat_id to integer if it's not None
-                    try:
-                        chat_id = int(data.get("id")) if data.get("id") is not None else None
-                        feedback = data.get("feedback")
-                        
-                        if feedback in ("like", "dislike") and chat_id:
-                            success = ChatRepository.update_feedback(chat_id, feedback)
-                            if success:
-                                await safe_send(websocket, {"status": "success", "message": f"Feedback '{feedback}' recorded for chat ID: {chat_id}"})
-                            else:
-                                await safe_send(websocket, {"status": "error", "message": f"Failed to record feedback for chat ID: {chat_id}"})
-                            continue
-                    except ValueError:
-                        await safe_send(websocket, {"status": "error", "message": f"Invalid chat ID format: {data.get('id')}"})
-                        continue
+            # --- Feedback Handling --- 
+            if "feedback" in data and "id" in data:
+                try:
+                    chat_id_str = data.get("id") 
+                    feedback = data.get("feedback")
                     
+                    if chat_id_str and feedback in ["like", "dislike"]:
+                        logger.info(f"Received feedback '{feedback}' for chat ID: {chat_id_str}")
+                        success = await ChatRepository.update_feedback(chat_id_str, feedback)
+                        if success:
+                            await safe_send(websocket, {"status": "feedback_updated", "id": chat_id_str})
+                        else:
+                            await safe_send(websocket, {"status": "feedback_failed", "id": chat_id_str})
+                    else:
+                        # Invalid feedback content, but it was intended as feedback
+                        logger.warning(f"Invalid feedback data received: id={chat_id_str}, feedback={feedback}")
+                        await safe_send(websocket, {"status": "invalid_feedback_data", "id": chat_id_str})
+                
+                except Exception as feedback_err:
+                    # Error during feedback processing
+                    logger.exception(f"Error processing feedback: {feedback_err}")
+                    await safe_send(websocket, {"status": "feedback_error", "id": data.get('id', 'unknown')})
+                
+                # Skip to the next message if it was feedback (processed or error)
+                continue 
+            
+            # --- Chat Message Handling (only if not feedback) ---
+            try:
                 chat_request = ChatRequest(**data)
             except ValidationError as ve:
                 error_details = str(ve)
@@ -112,7 +154,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "error_details": error_details,
                     "sources": []
                 })
-                continue
+                continue # Skip processing this invalid message
 
             question = chat_request.question
             language = chat_request.language
@@ -133,18 +175,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     "id": chat_str_id  # Include the string ID with the response
                 })
                 
-                # Save the query-rewriting agent's response to the database
-                try:
-                    # Save to the database using our custom string ID
-                    chat_id = ChatRepository.save_chat(question, agent_result["response"], [], chat_str_id)
-                    logger.info(f"Query-rewriting agent response saved to database with numeric ID: {chat_id} and string ID: {chat_str_id}")
-                except Exception as e:
-                    logger.exception(f"Failed to save query-rewriting agent response to database: {e}")
+                # Save the query-rewriting agent's response to the database in the background
+                background_tasks.add_task(ChatRepository.save_chat, app.state.pool, question, agent_result["response"], [], chat_str_id, RAG_APP_NAME)
                 
                 continue
                 
             # Use the rewritten query for retrieval if available
-            query_for_retrieval = agent_result.get("rewritten_query", question)
+            rewritten_query = agent_result.get("rewritten_query", question)
             
             # Filter previous chat messages based on relevance
             relevant_history = []
@@ -176,36 +213,47 @@ async def websocket_endpoint(websocket: WebSocket):
                 # If no relevance info or no previous chats, use empty history
                 relevant_history = []
             
-            # Retrieve documents using the retriever
-            try:
-                retrieved_docs = await asyncio.to_thread(retriever.invoke, query_for_retrieval)
-            except Exception as e:
-                error_details = str(e)
-                logger.exception(f"Retrieval error: {error_details}")
-                await safe_send(websocket, {
-                    "response": "I encountered an issue while searching for information to answer your question. This might be because the question is outside my knowledge domain or due to a temporary system issue.", 
-                    "error": "retrieval_error",
-                    "error_details": error_details,
-                    "sources": []
-                })
-                continue
+            await safe_send(websocket, {"type": "status", "message": "Starting retrieval..."})
+            start_time_retrieval = time.time()
 
-            docs = [{
-                "summary": ele.metadata.get("summary", ""),
-                "chunk": ele.page_content,
-                "page_source": ele.metadata.get("page_source", "")
-            } for ele in retrieved_docs]
+            # Perform balanced retrieval using the new function
+            docs_as_dicts = await fetch_balanced_documents(
+                query=rewritten_query, 
+                pc_client=pc, 
+                embed_model=embed_model, 
+                bm25_encoder=bm25_encoder,
+                num_webpages=20, # Default, can be adjusted
+                num_pdfs=20      # Default, can be adjusted
+            )
 
-            if not docs:
-                await safe_send(websocket, {"response": "No information found to answer your question.", "sources": []})
-                continue
+            if not docs_as_dicts:
+                # Fallback to Tavily if no documents are retrieved by Pinecone
+                logger.info(f"No documents found by Pinecone for query: {rewritten_query}. Falling back to Tavily.")
+                await safe_send(websocket, {"type": "status", "message": "No initial documents found, trying web search..."})
+                tavily_docs = await tavily_search(rewritten_query)
+                if tavily_docs:
+                    docs_as_dicts = tavily_docs # Use Tavily docs directly
+                    await safe_send(websocket, {"type": "status", "message": f"Found {len(docs_as_dicts)} documents from web search."})
+                else:
+                    logger.warning(f"Tavily search also returned no documents for query: {rewritten_query}")
+                    await safe_send(websocket, {"type": "status", "message": "No documents found from any source."})
+                    # Send an empty response or a specific message
+                    await safe_send(websocket, {"response": "Sorry, I couldn't find any relevant documents for your query.", "sources": [], "id": str(uuid.uuid4())})
+                    # Skip further processing for this message if no docs found
+                    continue # Or handle as per desired application flow
 
-            # Rerank the documents (fallback to original docs if reranking fails)
-            try:
-                ranked_docs = await asyncio.to_thread(rerank_docs, query_for_retrieval, docs, pc)
-            except Exception as e:
-                logger.exception("Reranking error:")
-                ranked_docs = docs
+            end_time_retrieval = time.time()
+            retrieval_time = end_time_retrieval - start_time_retrieval
+            logger.info(f"[PERF] Initial retrieval took {retrieval_time:.4f} seconds.")
+            logger.info(f"Retrieved {len(docs_as_dicts)} documents initially for query: {rewritten_query}")
+            await safe_send(websocket, {"type": "status", "message": f"Retrieved {len(docs_as_dicts)} documents, starting reranking..."})
+
+            # Rerank documents
+            if docs_as_dicts:
+                ranked_docs = await rerank_docs(rewritten_query, docs_as_dicts)
+                logger.info(f"Reranked and received {len(ranked_docs)} documents from rerank_docs.")
+            else:
+                ranked_docs = [] # No docs to rerank
 
             # Prepare the conversation messages
             messages = [{"role": "system", "content": get_system_prompt()}]
@@ -293,30 +341,23 @@ async def websocket_endpoint(websocket: WebSocket):
                     await safe_send(websocket, {"response": "Fallback response generation failed.", "sources": []})
                     continue
 
-            # Process and map citations in the final answer
-            try:
-                updated_answer, citations = process_citations(complete_answer, ranked_docs)
-            except Exception as e:
-                logger.exception("Error processing citations:")
-                updated_answer, citations = complete_answer, []
+            # Process citations (run sync function in thread)
+            updated_answer, citations = await asyncio.to_thread(
+                process_citations, complete_answer, ranked_docs
+            )
 
             # Generate a unique string ID for this chat
             chat_str_id = str(uuid.uuid4())
-            
+
             # Send the response to the client with the string ID immediately
             await safe_send(websocket, {
                 "response": updated_answer,
                 "sources": citations,
                 "id": chat_str_id  # Include the string ID with the response
             })
-            
-            # Now save the chat history to the database with our pre-generated ID
-            try:
-                # Save to the database using our custom string ID
-                chat_id = ChatRepository.save_chat(question, updated_answer, citations, chat_str_id)
-                logger.info(f"Chat saved to database with numeric ID: {chat_id} and string ID: {chat_str_id}")
-            except Exception as e:
-                logger.exception(f"Failed to save chat to database: {e}")
+
+            # Save chat to DB in the background
+            background_tasks.add_task(ChatRepository.save_chat, app.state.pool, question, updated_answer, citations, chat_str_id, RAG_APP_NAME)
 
         except WebSocketDisconnect:
             logger.info("Client disconnected")
@@ -367,7 +408,7 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
         }
         
     # Use the rewritten query for retrieval if available
-    query_for_retrieval = agent_result.get("rewritten_query", question)
+    rewritten_query = agent_result.get("rewritten_query", question)
     
     # Filter previous chat messages based on relevance
     relevant_history = []
@@ -399,34 +440,47 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
         # If no relevance info or no previous chats, use empty history
         relevant_history = []
     
-    # Retrieve documents using the retriever.
-    try:
-        retrieved_docs = await asyncio.to_thread(retriever.invoke, query_for_retrieval)
-    except Exception as e:
-        logger.exception("Document retrieval error:")
+    start_time_retrieval = time.time()
+
+    # Perform balanced retrieval using the new function
+    docs_for_rerank = await fetch_balanced_documents(
+        query=rewritten_query, 
+        pc_client=pc, 
+        embed_model=embed_model, 
+        bm25_encoder=bm25_encoder,
+        num_webpages=20, # Default, can be adjusted
+        num_pdfs=20      # Default, can be adjusted
+    )
+
+    if not docs_for_rerank:
+        logger.info(f"No documents found by Pinecone for query: {rewritten_query}. Falling back to Tavily.")
+        tavily_docs = await tavily_search(rewritten_query)
+        if tavily_docs:
+            docs_for_rerank = tavily_docs
+        else:
+            logger.warning(f"Tavily search also returned no documents for query: {rewritten_query}")
+            # Handle case where no documents are found from any source
+            # This might involve returning an empty list of sources or a specific message
+            # For now, we'll proceed with an empty docs_for_rerank, which rerank_docs should handle
+            pass # rerank_docs will receive an empty list
+
+    end_time_retrieval = time.time()
+    retrieval_time = end_time_retrieval - start_time_retrieval
+    logger.info(f"[PERF] Initial retrieval took {retrieval_time:.4f} seconds.")
+    logger.info(f"Retrieved {len(docs_for_rerank)} documents initially for query: {rewritten_query}")
+
+    # Rerank documents
+    if docs_for_rerank:
+        ranked_docs = await rerank_docs(rewritten_query, docs_for_rerank)
+        logger.info(f"Reranked and received {len(ranked_docs)} documents from rerank_docs.")
+    else:
+        ranked_docs = [] # No docs to rerank
+
+    if not ranked_docs:
         return {
-            "response": "This question is out of my scope. Please try again with another question.",
+            "response": "No relevant information found to answer your question.",
             "sources": []
         }
-
-    docs = [{
-        "summary": ele.metadata.get("summary", ""),
-        "chunk": ele.page_content,
-        "page_source": ele.metadata.get("page_source", "")
-    } for ele in retrieved_docs]
-
-    if not docs:
-        return {
-            "response": "No information found to answer your question.",
-            "sources": []
-        }
-
-    # Rerank the documents (fallback to original docs if reranking fails)
-    try:
-        ranked_docs = await asyncio.to_thread(rerank_docs, query_for_retrieval, docs, pc)
-    except Exception as e:
-        logger.exception("Reranking error:")
-        ranked_docs = docs
 
     # Prepare the conversation messages.
     messages = [{"role": "system", "content": get_system_prompt()}]
@@ -491,29 +545,50 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
                 "sources": []
             }
 
-    # Process and map citations in the final answer.
-    try:
-        updated_answer, citations = process_citations(complete_answer, ranked_docs)
-    except Exception as e:
-        logger.exception("Error processing citations:")
+    # Process citations after streaming completes (run sync function in thread)
+    if isResponseAvailable:
+        updated_answer, citations = await asyncio.to_thread(
+            process_citations, complete_answer, ranked_docs
+        )
+    else:
+        # Handle case where no response was generated (e.g., fallback search failed)
         updated_answer, citations = complete_answer, []
-        
+
     # Generate a unique string ID for this chat
     chat_str_id = str(uuid.uuid4())
     
-    # Define a function to save chat in the background
-    def save_chat_to_db(q, answer, cite, str_id):
+    # Define an ASYNC function to save chat in the background
+    async def save_chat_to_db(pool, q, answer, cite, str_id):
         try:
-            chat_id = ChatRepository.save_chat(q, answer, cite, str_id)
-            logger.info(f"Chat saved to database with numeric ID: {chat_id} and string ID: {str_id}")
+            # Await the async repository method
+            chat_id = await ChatRepository.save_chat(pool, q, answer, cite, str_id, RAG_APP_NAME)
+            if chat_id:
+                logger.info(f"Chat saved to database with numeric ID: {chat_id} and string ID: {str_id}")
+            else:
+                logger.error(f"Failed to save chat to database (String ID: {str_id})")
             return chat_id
         except Exception as e:
-            logger.exception(f"Failed to save chat to database: {e}")
+            logger.exception(f"Failed to save chat to database (String ID: {str_id}): {e}")
             return None
     
     # Add the save operation to background tasks
     # This will run after the response is sent to the client
-    background_tasks.add_task(save_chat_to_db, question, updated_answer, citations, chat_str_id)
+    # Define an async function to save chat in the background, now including RAG_APP_NAME
+    async def save_chat_to_db(pool, q, answer, cite, str_id, app_name):
+        try:
+            # Await the async repository method, passing the app name
+            chat_id = await ChatRepository.save_chat(pool, q, answer, cite, str_id, app_name)
+            if chat_id:
+                logger.info(f"Chat saved to database with numeric ID: {chat_id} and string ID: {str_id} from app: {app_name}")
+            else:
+                logger.error(f"Failed to save chat to database (String ID: {str_id})")
+            return chat_id
+        except Exception as e:
+            logger.exception(f"Failed to save chat to database (String ID: {str_id}): {e}")
+            return None
+
+    # Add the save operation to background tasks, including the RAG_APP_NAME
+    background_tasks.add_task(save_chat_to_db, app.state.pool, question, updated_answer, citations, chat_str_id, RAG_APP_NAME)
 
     # Return the response immediately without waiting for database operation
     return {"response": updated_answer, "sources": citations, "id": chat_str_id}
@@ -531,7 +606,24 @@ async def api_root():
     return JSONResponse(content={"message": "API is working"})
 
 @app.get("/health")
-async def health():
+async def health(request: Request):
+    # Add a database connection check
+    db_status = "connected"
+    db_message = "Database connection successful."
+    pool = request.app.state.pool
+    if not pool or pool.is_closing():
+         db_status = "disconnected"
+         db_message = "Database pool is closed or not initialized."
+    else:
+        try:
+            # Try a simple query
+            async with pool.acquire() as conn:
+                await conn.fetchval('SELECT 1')
+        except Exception as db_err:
+            logger.error(f"Database health check failed: {db_err}")
+            db_status = "error"
+            db_message = f"Database connection error: {str(db_err)[:100]}..."
+            
     try:
         # Check if embedding model is loaded
         if embed_model is None:
@@ -554,9 +646,11 @@ async def health():
                 "message": "API is operational",
                 "components": {
                     "embedding_model": "initialized",
-                    "pinecone": "connected"
+                    "pinecone": "connected",
+                    "database": db_status
                 }
-            }
+            },
+            media_type="application/json"
         )
     except Exception as e:
         logger.exception("Health check failed:")

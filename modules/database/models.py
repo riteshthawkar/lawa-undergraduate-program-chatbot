@@ -21,6 +21,7 @@ class ChatHistoryEntry(BaseModel):
     timestamp: Optional[datetime] = None
     feedback: Optional[str] = None
     id_str: Optional[str] = None  # String ID (UUID) for the chat entry
+    rag_app_name: Optional[str] = None # Name of the RAG application
     
     class Config:
         from_attributes = True
