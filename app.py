@@ -124,7 +124,7 @@ async def websocket_endpoint(websocket: WebSocket, background_tasks: BackgroundT
                     
                     if chat_id_str and feedback in ["like", "dislike"]:
                         logger.info(f"Received feedback '{feedback}' for chat ID: {chat_id_str}")
-                        success = await ChatRepository.update_feedback(chat_id_str, feedback)
+                        success = await ChatRepository.update_feedback(app.state.pool, chat_id_str, feedback)
                         if success:
                             await safe_send(websocket, {"status": "feedback_updated", "id": chat_id_str})
                         else:
@@ -175,8 +175,10 @@ async def websocket_endpoint(websocket: WebSocket, background_tasks: BackgroundT
                     "id": chat_str_id  # Include the string ID with the response
                 })
                 
-                # Save the query-rewriting agent's response to the database in the background
-                background_tasks.add_task(ChatRepository.save_chat, app.state.pool, question, agent_result["response"], [], chat_str_id, RAG_APP_NAME)
+                # Save the query-rewriting agent's response to the database using asyncio.create_task
+                asyncio.create_task(
+                    ChatRepository.save_chat(app.state.pool, question, agent_result["response"], [], chat_str_id, RAG_APP_NAME)
+                )
                 
                 continue
                 
@@ -356,8 +358,15 @@ async def websocket_endpoint(websocket: WebSocket, background_tasks: BackgroundT
                 "id": chat_str_id  # Include the string ID with the response
             })
 
-            # Save chat to DB in the background
-            background_tasks.add_task(ChatRepository.save_chat, app.state.pool, question, updated_answer, citations, chat_str_id, RAG_APP_NAME)
+            # Save chat to DB using asyncio.create_task
+            save_task = asyncio.create_task(
+                ChatRepository.save_chat(app.state.pool, question, updated_answer, citations, chat_str_id, RAG_APP_NAME)
+            )
+            
+            # Add logging to track save operation
+            save_task.add_done_callback(
+                lambda t: logger.info(f"Chat save task completed with result: {t.result() if not t.exception() else f'Error: {t.exception()}'}")
+            )
 
         except WebSocketDisconnect:
             logger.info("Client disconnected")
