@@ -1,14 +1,13 @@
 """
 API views for database operations.
 """
-from fastapi import APIRouter, HTTPException, status
-from typing import List, Dict, Any
+from fastapi import APIRouter, HTTPException, status, Request
+from typing import List, Dict, Any, Optional
 import datetime
 
 from ..config import logger
 from .models import ChatHistoryEntry, FeedbackUpdate
 from .repository import ChatRepository
-from .database import get_db_connection, TABLE_PREFIX
 
 # Create a router for database operations
 router = APIRouter(tags=["history"])
@@ -19,7 +18,7 @@ router = APIRouter(tags=["history"])
 # Define fixed path routes first, before any parameterized routes
 
 @router.get("/history/export", status_code=status.HTTP_200_OK)
-async def export_all_chats():
+async def export_all_chats(request: Request):
     """
     Export all chat history data in JSON format.
     
@@ -27,8 +26,13 @@ async def export_all_chats():
         dict: All chat history data
     """
     try:
-        # Get all chats without pagination
-        all_chats = ChatRepository.get_all_chats(limit=10000, offset=0)
+        pool = request.app.state.pool
+        if not pool:
+            logger.error("Database pool not available in request state for /history/export")
+            raise HTTPException(status_code=500, detail="Database connection not available")
+        
+        # Get all chats without pagination using await
+        all_chats = await ChatRepository.get_all_chats(pool, limit=10000, offset=0)
         
         # Convert to a format suitable for JSON export
         export_data = {
@@ -46,7 +50,7 @@ async def export_all_chats():
         )
 
 @router.get("/history/stats", status_code=status.HTTP_200_OK)
-async def get_history_stats():
+async def get_history_stats(request: Request):
     """
     Get statistics about chat history.
     
@@ -54,22 +58,25 @@ async def get_history_stats():
         dict: Statistics about chat history including total_chats, liked, disliked, and no_feedback counts
     """
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            
+        pool = request.app.state.pool
+        if not pool:
+            logger.error("Database pool not available in request state for /history/stats")
+            raise HTTPException(status_code=500, detail="Database connection not available")
+        
+        async with pool.acquire() as conn:
             # Get total chats
-            cursor.execute("SELECT COUNT(*) FROM chat_history")
-            total = cursor.fetchone()['count']
+            total = await conn.fetchval("SELECT COUNT(*) FROM chat_history")
             
             # Get liked chats
-            cursor.execute("SELECT COUNT(*) FROM chat_history WHERE feedback = 'like'")
-            liked = cursor.fetchone()['count']
+            liked = await conn.fetchval("SELECT COUNT(*) FROM chat_history WHERE feedback = 'like'")
             
             # Get disliked chats
-            cursor.execute("SELECT COUNT(*) FROM chat_history WHERE feedback = 'dislike'")
-            disliked = cursor.fetchone()['count']
+            disliked = await conn.fetchval("SELECT COUNT(*) FROM chat_history WHERE feedback = 'dislike'")
             
-            # Calculate no feedback chats
+            # Calculate no feedback chats (ensure counts are not None)
+            total = total or 0
+            liked = liked or 0
+            disliked = disliked or 0
             no_feedback = total - liked - disliked
             
             return {
@@ -86,7 +93,7 @@ async def get_history_stats():
         )
 
 @router.get("/history/count", status_code=status.HTTP_200_OK)
-async def get_history_count():
+async def get_history_count(request: Request):
     """
     Get the total count of chat history entries.
     
@@ -94,11 +101,14 @@ async def get_history_count():
         dict: Dictionary with the count
     """
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM chat_history")
-            count = cursor.fetchone()['count']
-            return {"count": count}
+        pool = request.app.state.pool
+        if not pool:
+            logger.error("Database pool not available in request state for /history/count")
+            raise HTTPException(status_code=500, detail="Database connection not available")
+        
+        async with pool.acquire() as conn:
+            count = await conn.fetchval("SELECT COUNT(*) FROM chat_history")
+            return {"count": count or 0} # Return 0 if count is None
     except Exception as e:
         logger.error(f"Error getting history count: {e}")
         raise HTTPException(
@@ -107,7 +117,7 @@ async def get_history_count():
         )
 
 @router.get("/history", response_model=List[ChatHistoryEntry])
-async def get_all_chats_paginated(limit: int = 100, offset: int = 0) -> List[ChatHistoryEntry]:
+async def get_all_chats_paginated(request: Request, limit: int = 100, offset: int = 0) -> List[ChatHistoryEntry]:
     """
     Get all chat entries with pagination.
     
@@ -118,12 +128,25 @@ async def get_all_chats_paginated(limit: int = 100, offset: int = 0) -> List[Cha
     Returns:
         List[ChatHistoryEntry]: List of chat entries
     """
-    return ChatRepository.get_all_chats(limit, offset)
+    try:
+        pool = request.app.state.pool
+        if not pool:
+            logger.error("Database pool not available in request state for /history")
+            raise HTTPException(status_code=500, detail="Database connection not available")
+        
+        # Use await for the async repository method
+        return await ChatRepository.get_all_chats(pool, limit, offset)
+    except Exception as e:
+        logger.error(f"Error getting all chats: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get all chats"
+        )
 
 # Now define the parameterized routes
 
-@router.post("/history", status_code=status.HTTP_201_CREATED, response_model=Dict[str, int])
-async def save_chat_history(query: str, response: str, sources: List[Dict[str, str]]) -> Dict[str, int]:
+@router.post("/history", status_code=status.HTTP_201_CREATED, response_model=Dict[str, Any]) # Allow string ID
+async def save_chat_history(request: Request, query: str, response: str, sources: List[Dict[str, str]], custom_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Save a chat interaction to the database.
     
@@ -131,13 +154,26 @@ async def save_chat_history(query: str, response: str, sources: List[Dict[str, s
         query: The user's query
         response: The LLM's response
         sources: List of citation sources
+        custom_id: Optional custom ID for the chat
         
     Returns:
-        Dict[str, int]: Dictionary with the ID of the saved chat
+        Dict[str, Any]: Dictionary with the ID (numeric or string) of the saved chat
     """
     try:
-        chat_id = ChatRepository.save_chat(query, response, sources)
-        return {"id": chat_id}
+        pool = request.app.state.pool
+        if not pool:
+            logger.error("Database pool not available in request state for /history")
+            raise HTTPException(status_code=500, detail="Database connection not available")
+        
+        # Use await for the async repository method
+        chat_id = await ChatRepository.save_chat(pool, query, response, sources, custom_id)
+        if chat_id is None and custom_id is None:
+             raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to save chat history (no ID returned)"
+            )
+        # Return the custom ID if provided, otherwise the generated numeric ID
+        return {"id": custom_id if custom_id else chat_id}
     except Exception as e:
         logger.error(f"Error saving chat history: {e}")
         raise HTTPException(
@@ -147,7 +183,7 @@ async def save_chat_history(query: str, response: str, sources: List[Dict[str, s
 
 @router.put("/history/{chat_id}/feedback", status_code=status.HTTP_200_OK)
 @router.post("/history/{chat_id}/feedback", status_code=status.HTTP_200_OK)
-async def update_chat_feedback(chat_id: str, feedback_update: FeedbackUpdate) -> Dict[str, str]:
+async def update_chat_feedback(request: Request, chat_id: str, feedback_update: FeedbackUpdate) -> Dict[str, str]:
     """
     Update the feedback for a chat entry.
     
@@ -158,23 +194,31 @@ async def update_chat_feedback(chat_id: str, feedback_update: FeedbackUpdate) ->
     Returns:
         Dict[str, str]: Success message
     """
-    success = ChatRepository.update_feedback(
-        chat_id=chat_id, 
-        feedback=feedback_update.feedback
-    )
-    
-    if not success:
+    try:
+        pool = request.app.state.pool
+        if not pool:
+            logger.error("Database pool not available in request state for /history/{chat_id}/feedback")
+            raise HTTPException(status_code=500, detail="Database connection not available")
+        
+        # Use await for the async repository method
+        success = await ChatRepository.update_feedback(pool, chat_id=chat_id, feedback=feedback_update.feedback)
+        
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Chat with ID {chat_id} not found or feedback update failed"
+            )
+        
+        return {"message": f"Feedback updated for chat ID: {chat_id}"}
+    except Exception as e:
+        logger.error(f"Error updating chat feedback: {e}")
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Chat with ID {chat_id} not found or feedback update failed"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update chat feedback"
         )
-    
-    return {"message": f"Feedback updated for chat ID: {chat_id}"}
-
-# This route was moved to the top of the file
 
 @router.get("/history/{chat_id}", response_model=ChatHistoryEntry)
-async def get_chat_by_id(chat_id: str) -> ChatHistoryEntry:
+async def get_chat_by_id(request: Request, chat_id: str) -> ChatHistoryEntry:
     """
     Get a chat entry by ID.
     
@@ -184,24 +228,31 @@ async def get_chat_by_id(chat_id: str) -> ChatHistoryEntry:
     Returns:
         ChatHistoryEntry: The chat entry
     """
-    chat = ChatRepository.get_chat_by_id(chat_id)
-    
-    if not chat:
+    try:
+        pool = request.app.state.pool
+        if not pool:
+            logger.error("Database pool not available in request state for /history/{chat_id}")
+            raise HTTPException(status_code=500, detail="Database connection not available")
+        
+        # Use await for the async repository method
+        chat = await ChatRepository.get_chat_by_id(pool, chat_id)
+        
+        if not chat:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Chat with ID {chat_id} not found"
+            )
+        
+        return chat
+    except Exception as e:
+        logger.error(f"Error getting chat by ID: {e}")
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Chat with ID {chat_id} not found"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get chat by ID"
         )
-    
-    return chat
-
-# This route was moved to the top of the file
-
-# This route was moved to the top of the file
-
-# All fixed routes have been moved to the top of the file
 
 @router.delete("/history/{chat_id}", status_code=status.HTTP_200_OK)
-async def delete_chat(chat_id: str) -> Dict[str, str]:
+async def delete_chat(request: Request, chat_id: str) -> Dict[str, str]:
     """
     Delete a chat entry and its associated sources.
     
@@ -211,12 +262,25 @@ async def delete_chat(chat_id: str) -> Dict[str, str]:
     Returns:
         Dict[str, str]: Success message
     """
-    success = ChatRepository.delete_chat(chat_id)
-    
-    if not success:
+    try:
+        pool = request.app.state.pool
+        if not pool:
+            logger.error("Database pool not available in request state for /history/{chat_id}")
+            raise HTTPException(status_code=500, detail="Database connection not available")
+        
+        # Use await for the async repository method
+        success = await ChatRepository.delete_chat(pool, chat_id)
+        
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Chat with ID {chat_id} not found or deletion failed"
+            )
+        
+        return {"message": f"Chat with ID {chat_id} deleted successfully"}
+    except Exception as e:
+        logger.error(f"Error deleting chat: {e}")
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Chat with ID {chat_id} not found or deletion failed"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete chat"
         )
-    
-    return {"message": f"Chat with ID {chat_id} deleted successfully"}
