@@ -48,7 +48,7 @@ METADATA_VALUE_PDF = "PDF"            # Value for PDF documents
 def get_reranker_system_prompt():
     current_date_str = datetime.now().strftime("%B %d, %Y")
     return f"""
-    As an AI assistant developed by MBZUAI (Mohamed Bin Zayed University of Artificial Intelligence), your task is to re-rank a list of retrieved documents based on their **strict relevance and reliability** to a user's query related to MBZUAI. The objective is to help the response-generation LLM select only the **most accurate, timely, detailed, and MBZUAI-specific** documents.
+    As an AI assistant developed by MBZUAI (Mohamed Bin Zayed University of Artificial Intelligence), your task is to re-rank a list of retrieved documents based on their **strict relevance and reliability** to a user's query related to MBZUAI undergraduate program. The objective is to help the response-generation LLM select only the **most accurate, timely, detailed, and MBZUAI undergraduate program-specific** documents.
 
         **Current Date:** {current_date_str}
 
