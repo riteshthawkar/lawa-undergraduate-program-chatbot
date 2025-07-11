@@ -17,7 +17,7 @@ from modules.config import logger, validate_env_vars, get_system_prompt, RAG_APP
 from modules.schemas import ChatRequest, CitationSource
 from modules.utils import safe_send, format_query
 from modules.citations import process_citations
-from modules.retrieval import initialize_pinecone_with_embeddings, rerank_docs, tavily_search, fetch_balanced_documents
+from modules.retrieval import initialize_pinecone_clients, initialize_retrieval_components, rerank_docs, fetch_balanced_documents
 from modules.query_rewriting import query_rewriting_agent, openai_client
 
 # Import database modules
@@ -30,16 +30,7 @@ from modules.database.views import router as history_router
 # ------------------------------------------------------------------------------
 validate_env_vars()
 
-# ------------------------------------------------------------------------------
-# Initialize embedding model globally
-# ------------------------------------------------------------------------------
-logger.info("Initializing embedding model globally...")
-embed_model = HuggingFaceEmbeddings(
-    model_name="Qwen/Qwen3-Embedding-0.6B",
-    model_kwargs={"trust_remote_code": True}
-)
 
-logger.info("Embedding model initialized successfully")
 
 # ------------------------------------------------------------------------------
 # Lifespan manager for database connection pool
@@ -90,13 +81,11 @@ app.add_middleware(
 base_dir = os.path.dirname(os.path.abspath(__file__))
 
 # ------------------------------------------------------------------------------
-# Initialize Pinecone retriever and client using global embedding model
+# Initialize retrieval components and Pinecone clients
 # ------------------------------------------------------------------------------
-logger.info("Initializing Pinecone with pre-loaded embedding model...")
-# Retriever is now initialized on-the-fly in fetch_balanced_documents
-# initialize_pinecone_with_embeddings now returns bm25, pc, async_pc
-bm25_encoder, pc, async_pc = initialize_pinecone_with_embeddings(embed_model)
-logger.info("Pinecone components (bm25_encoder, pc, async_pc) initialized successfully.")
+embed_model, bm25_encoder = initialize_retrieval_components()
+pinecone_summary_index, pinecone_text_index = initialize_pinecone_clients()
+logger.info("Retrieval components and Pinecone clients initialized successfully.")
 
 # ------------------------------------------------------------------------------
 # Include database history router (endpoints within will need async updates too)
@@ -182,80 +171,66 @@ async def websocket_endpoint(websocket: WebSocket, background_tasks: BackgroundT
                 
                 continue
                 
-            # Use the rewritten query for retrieval if available
-            rewritten_query = agent_result.get("rewritten_query", question)
-            
+            # Extract results from the query rewriting agent
+            metadata_query = agent_result.get("metadata_query", question)
+            natural_language_query = agent_result.get("natural_language_query", question)
+            is_time_sensitive = agent_result.get("is_time_sensitive", False)
+
             # Filter previous chat messages based on relevance
             relevant_history = []
             if "relevant_history_indices" in agent_result and previous_chats:
                 indices = agent_result["relevant_history_indices"]
-                
-                # Create a set to track which indices to include (including assistants' responses)
                 indices_to_include = set()
-                
-                # Include each relevant message index
                 for idx in indices:
                     if 0 <= idx < len(previous_chats):
                         indices_to_include.add(idx)
-                        # If this is a user message and there's an assistant response right after,
-                        # include the assistant's response too
                         if idx + 1 < len(previous_chats) and previous_chats[idx]["role"] == "user" and previous_chats[idx + 1]["role"] == "assistant":
                             indices_to_include.add(idx + 1)
-                
-                # Sort the indices to maintain conversation order
                 sorted_indices = sorted(indices_to_include)
-                
-                # Get relevant messages in order
                 relevant_history = [previous_chats[i] for i in sorted_indices]
-                
-                # Log the filtering of message history
                 if len(relevant_history) < len(previous_chats):
                     logger.info(f"Filtered message history from {len(previous_chats)} to {len(relevant_history)} relevant messages")
             else:
-                # If no relevance info or no previous chats, use empty history
                 relevant_history = []
-            
+
             await safe_send(websocket, {"type": "status", "message": "Starting retrieval..."})
             start_time_retrieval = time.time()
 
-            # Perform balanced retrieval using the new function
+            # Perform balanced retrieval using the dual-query system
             docs_as_dicts = await fetch_balanced_documents(
-                query=rewritten_query, 
-                pc_client=pc, 
-                embed_model=embed_model, 
-                bm25_encoder=bm25_encoder,
-                num_webpages=20, # Default, can be adjusted
-                num_pdfs=20      # Default, can be adjusted
+                metadata_query=metadata_query,
+                natural_language_query=natural_language_query,
+                pinecone_summary_index=pinecone_summary_index,
+                pinecone_text_index=pinecone_text_index,
+                embed_model=embed_model,
+                bm25_encoder=bm25_encoder
             )
 
             if not docs_as_dicts:
-                # Fallback to Tavily if no documents are retrieved by Pinecone
-                logger.info(f"No documents found by Pinecone for query: {rewritten_query}. Falling back to Tavily.")
+                logger.info(f"No documents found by Pinecone for query: '{question}'. Falling back to Tavily.")
                 await safe_send(websocket, {"type": "status", "message": "No initial documents found, trying web search..."})
-                tavily_docs = await tavily_search(rewritten_query)
+                tavily_docs = await tavily_search(natural_language_query) # Use NL query for web search
                 if tavily_docs:
-                    docs_as_dicts = tavily_docs # Use Tavily docs directly
+                    docs_as_dicts = tavily_docs
                     await safe_send(websocket, {"type": "status", "message": f"Found {len(docs_as_dicts)} documents from web search."})
                 else:
-                    logger.warning(f"Tavily search also returned no documents for query: {rewritten_query}")
+                    logger.warning(f"Tavily search also returned no documents for query: '{natural_language_query}'")
                     await safe_send(websocket, {"type": "status", "message": "No documents found from any source."})
-                    # Send an empty response or a specific message
                     await safe_send(websocket, {"response": "Sorry, I couldn't find any relevant documents for your query.", "sources": [], "id": str(uuid.uuid4())})
-                    # Skip further processing for this message if no docs found
-                    continue # Or handle as per desired application flow
+                    continue
 
             end_time_retrieval = time.time()
             retrieval_time = end_time_retrieval - start_time_retrieval
             logger.info(f"[PERF] Initial retrieval took {retrieval_time:.4f} seconds.")
-            logger.info(f"Retrieved {len(docs_as_dicts)} documents initially for query: {rewritten_query}")
+            logger.info(f"Retrieved {len(docs_as_dicts)} documents initially for query: '{question}'")
             await safe_send(websocket, {"type": "status", "message": f"Retrieved {len(docs_as_dicts)} documents, starting reranking..."})
 
-            # Rerank documents
+            # Rerank documents using the original query and time-sensitivity flag
             if docs_as_dicts:
-                ranked_docs = await rerank_docs(rewritten_query, docs_as_dicts)
+                ranked_docs = await rerank_docs(question, docs_as_dicts, is_time_sensitive)
                 logger.info(f"Reranked and received {len(ranked_docs)} documents from rerank_docs.")
             else:
-                ranked_docs = [] # No docs to rerank
+                ranked_docs = []
 
             # Prepare the conversation messages
             messages = [{"role": "system", "content": get_system_prompt()}]

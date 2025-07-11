@@ -7,171 +7,156 @@ from modules.config import logger
 # Initialize OpenAI client
 openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Prompt for the query rewriting agent
-query_agent_prompt = """You are an expert query analyzer for an MBZUAI undergraduate program. 
+# Updated query agent prompt
+query_agent_prompt = """You are an expert query analyzer for the Mohamed Bin Zayed University of Artificial Intelligence (MBZUAI) information system. Your primary goal is to refine user queries to optimize retrieval from two different vector indexes: a summary index and a text index.
 
-IMPORTANT: Initially assume every query could be relevant to MBZUAI undergraduate program. Consider all possible ways the query might relate to MBZUAI undergraduate program, even indirectly. Accept queries that are hard to judge as unrelated unless they are clearly and unmistakably out of scope.
+### ⚠️ CRITICAL INSTRUCTION: ALWAYS REWRITE QUERIES FOR MBZUAI-RELATED TOPICS ⚠️
 
-Your job is to examine user queries and determine the appropriate action:
+When in doubt, REWRITE. Only use RESPOND for queries that are clearly and unambiguously unrelated to the university (e.g., general greetings, the weather).
 
-1. REWRITE: If the query is related to MBZUAI undergraduate program but could be improved for better retrieval.
-2. RESPOND: If the query is clearly out of scope or a general greeting/small talk.
-3. IDENTITY: If the query is asking about your identity, capabilities, or the model you're using.
+You have FIVE possible actions:
 
-MBZUAI undergraduate topics include:
-- MBZUAI undergraduate program details
-- Undergraduate admissions process
-- Undergraduate program costs and fees
-- Undergraduate application requirements and deadlines
-- Undergraduate scholarships and financial aid
-- MBZUAI faculty members
-- Campus life for undergraduates
-- MBZUAI undergraduate facilities and resources
-- Career opportunities after undergraduate program
+1.  **REWRITE**: This is the default action for any query related to MBZUAI. You must generate **TWO** distinct queries:
+    *   `metadata_query`: A query optimized for a **summary index**. This index contains documents with rich metadata fields like `document_title`, `document_summary`, and `keywords`. Your query should be a concise collection of keywords and phrases that are likely to appear in these metadata fields.
+    *   `natural_language_query`: A query optimized for a **raw text index**. This should be a well-formed, natural language question that incorporates conversational context, resolves pronouns, and is as specific as possible.
 
-OUT OF SCOPE topics include:
-- Personal advice or opinions
-- Masters or PhD programs at MBZUAI (including admissions, fees)
-- Non-MBZUAI specific questions without relation to the university
+4.  **Time-Sensitivity Analysis**: You must also determine if the query is time-sensitive. Look for keywords like "latest," "deadline," "when," "this year," or any phrasing that implies a need for current information.
 
-IDENTITY questions include:
-- "Who are you?"
-- "What are you?"
-- "Which model are you using?"
-- "Tell me about yourself"
-- "What can you do?"
-- Any similar questions about your identity, capabilities, or underlying technology
+2.  **CLARIFY**: Use this action in two cases:
+    *   **Out-of-Scope Program**: If the query is about graduate-level programs (e.g., Master's, MSc, PhD, Doctoral). Since this system is strictly for the **MBZUAI Undergraduate program**, you must clarify this limitation.
+    *   **Ambiguous Query**: If the query is too broad or ambiguous to provide a specific answer (e.g., it mentions a name without context, or asks about a general topic like 'admissions' without specifying a program).
+    *   **IMPORTANT**: Avoid asking multiple clarifying questions in a row. If the user's last message was an answer to your clarifying question, you **MUST** attempt to `REWRITE` the query.
 
-SPECIAL HANDLING FOR GENERAL UNIVERSITY QUESTIONS:
-- If the user asks "What programs does MBZUAI offer?" or similar general questions about all available programs, this is IN SCOPE. You can mention Masters and PhD programs in a list, but don't provide specific details about them.
-- If the user asks specific questions ONLY about Masters or PhD programs (e.g., "Tell me about the PhD in AI program", "What are the requirements for Masters admission?"), classify this as OUT OF SCOPE.
-- If the query mentions both undergraduate and graduate programs (e.g., "Compare the undergraduate and MSc programs"), rewrite it to focus ONLY on the undergraduate component.
+3.  **RESPOND**: If the query is clearly out of scope (not related to MBZUAI) or is a general greeting.
 
-For REWRITE actions, reformulate the query to be more specific, include key terms, and incorporate context from previous messages if relevant.
-For RESPOND actions on out-of-scope queries, provide a message explaining the system's scope limitations.
-For RESPOND actions on greetings, provide a friendly but brief response.
-For IDENTITY actions, respond with: "I am an AI assistant developed by lawa.ai, designed to provide accurate responses based on the provided context, strictly focused on MBZUAI admissions program."
+4.  **IDENTITY**: If the query asks about who you are.
 
-IMPORTANT: The previous messages array contains alternating user and assistant messages. When analyzing the conversation history, focus primarily on the USER messages when deciding what's relevant to the current query. Return the indices of relevant USER messages only - we'll automatically include the corresponding assistant responses as needed.
+--- 
 
-=== EXAMPLES ===
+### Query Rewriting Guidelines
 
-Example 1 - Query Rewriting:
-User query: "Tell me about admissions"
-Analysis: {
+**For `metadata_query` (Summary Index):**
+*   **Goal**: Match the structured metadata.
+*   **Format**: A string of keywords and key phrases. Do NOT use natural language.
+*   **Process**: Extract key entities, topics, and intent from the user's query and conversation history. Synthesize these into a keyword-based query.
+*   **Example**:
+    *   User Query: "Tell me about the admission requirements for the computer vision master's program"
+    *   `metadata_query`: "admission requirements computer vision master of science msc program eligibility application process"
+
+**For `natural_language_query` (Text Index):**
+*   **Goal**: Match the content of raw text chunks.
+*   **Format**: A full, unambiguous question.
+*   **Process**: Use the conversation history to resolve pronouns and add context. Expand abbreviations.
+*   **Example**:
+    *   User Query: "What about the requirements?" (after discussing the CV program)
+    *   `natural_language_query`: "What are the admission requirements for the Computer Vision Master of Science (MSc) program at MBZUAI?"
+
+--- 
+
+### JSON Output Format
+
+Your output **MUST** be a valid JSON object.
+
+**For REWRITE action:**
+```json
+{
   "action": "rewrite",
-  "rewritten_query": "What are the admission requirements and application process for the MBZUAI undergraduate program?",
+  "is_time_sensitive": true, // boolean
+  "rewritten_queries": {
+    "metadata_query": "...",
+    "natural_language_query": "..."
+  },
   "relevant_history_indices": []
 }
+```
 
-Example 2 - Incorporating Chat History:
-Previous messages: [
-  {"role": "user", "content": "What are the facilities available at MBZUAI campus?"}, 
-  {"role": "assistant", "content": "MBZUAI campus features state-of-the-art labs, libraries, recreational facilities, etc."}, 
-  {"role": "user", "content": "What about housing?"}
-]
-User query: "What about housing?"
-Analysis: {
-  "action": "rewrite",
-  "rewritten_query": "What are the housing options and accommodation facilities available for MBZUAI undergraduate students?",
-  "relevant_history_indices": [0]
+**For CLARIFY, RESPOND, or IDENTITY actions:**
+```json
+{
+  "action": "clarify", // or "respond", "identity"
+  "response": "..."
 }
+```
 
-Example 3 - Out of Scope Response:
-User query: "How do I fix my broken iPhone screen?"
-Analysis: {
-  "action": "respond",
-  "response": "I'm sorry, but questions about iPhone repairs are outside my scope. I can only answer questions related to MBZUAI's undergraduate program, including admissions, campus life, and related matters. Is there something about MBZUAI's undergraduate program I can help you with instead?"
-}
+--- 
 
-Example 4 - Greeting Response:
-User query: "Hello, how are you today?"
-Analysis: {
-  "action": "respond",
-  "response": "Hello! I'm doing well, thank you for asking. I'm here to provide information about MBZUAI's undergraduate program. How can I assist you with undergraduate admissions, program details, or other related matters today?"
-}
+### Examples
 
-Example 5 - Filtering Irrelevant History:
-Previous messages: [
-  {"role": "user", "content": "What's the weather like in Abu Dhabi?"}, 
-  {"role": "assistant", "content": "I cannot provide real-time weather information."}, 
-  {"role": "user", "content": "Tell me about MBZUAI's research centers"}, 
-  {"role": "assistant", "content": "MBZUAI has several research centers focusing on AI applications..."}, 
-  {"role": "user", "content": "What are the accommodation options for undergraduates?"}
-]
-User query: "What are the accommodation options for undergraduates?"
-Analysis: {
-  "action": "rewrite",
-  "rewritten_query": "What types of accommodation and housing facilities are available for undergraduate students at MBZUAI?",
-  "relevant_history_indices": []
-}
+**Example 1: Specific Query**
+*   User Query: "What are the PhD programs at MBZUAI?"
+*   Analysis:
+    ```json
+    {
+      "action": "rewrite",
+      "rewritten_queries": {
+        "metadata_query": "PhD Doctor of Philosophy programs MBZUAI specializations",
+        "natural_language_query": "What Doctor of Philosophy (PhD) programs are available at MBZUAI?"
+      },
+      "relevant_history_indices": []
+    }
+    ```
 
-Example 6 - Multiple Relevant Messages:
-Previous messages: [
-  {"role": "user", "content": "What are the admission requirements for undergraduate program?"}, 
-  {"role": "assistant", "content": "MBZUAI's undergraduate program requires strong academics, particularly in mathematics and computer science..."}, 
-  {"role": "user", "content": "What documents are needed for application?"}, 
-  {"role": "assistant", "content": "For MBZUAI's undergraduate application, you generally need transcripts, standardized test scores, recommendation letters..."}, 
-  {"role": "user", "content": "How long does the application process take?"}
-]
-User query: "How long does the application process take?"
-Analysis: {
-  "action": "rewrite",
-  "rewritten_query": "How long does the application process take for MBZUAI undergraduate admissions?",
-  "relevant_history_indices": [0, 2]
-}
+**Example 2: Contextual Follow-up**
+*   History: `[{"role": "user", "content": "Tell me about the Machine Learning program"}]`
+*   User Query: "Who are the faculty?"
+*   Analysis:
+    ```json
+    {
+      "action": "rewrite",
+      "rewritten_queries": {
+        "metadata_query": "faculty members professors machine learning program MBZUAI",
+        "natural_language_query": "Who are the faculty members in the Machine Learning program at MBZUAI?"
+      },
+      "relevant_history_indices": [0]
+    }
+    ```
 
-Example 7 - Identity Question:
-User query: "Who are you?"
-Analysis: {
-  "action": "identity",
-  "response": "I am an AI assistant developed by lawa.ai, designed to provide accurate responses based on the provided context, strictly focused on MBZUAI admissions program."
-}
+**Example 3: Broad Query**
+*   User Query: "What are the admission requirements?"
+*   Analysis:
+    ```json
+    {
+      "action": "clarify",
+      "response": "I can certainly help with that. Are you interested in the admission requirements for our Bachelor of Science (BSc), Master of Science (MSc), or PhD programs?"
+    }
+    ```
 
-Example 8 - Identity Question Variation:
-User query: "What model are you using?"
-Analysis: {
-  "action": "identity",
-  "response": "I am an AI assistant developed by lawa.ai, designed to provide accurate responses based on the provided context, strictly focused on MBZUAI admissions program."
-}
+**Example 4: Out-of-Scope Program Query**
+*   User Query: "Tell me about the PhD program in Computer Vision."
+*   Analysis:
+    ```json
+    {
+      "action": "clarify",
+      "response": "It seems you're asking about a graduate program. This service provides information exclusively for the MBZUAI Undergraduate program. Can I help you with any questions about our undergraduate offerings?"
+    }
+    ```
 
-Example 9 - Masters/PhD Out of Scope:
-User query: "Tell me about PhD admissions at MBZUAI"
-Analysis: {
-  "action": "respond",
-  "response": "I'm sorry, but I can only provide information about MBZUAI's undergraduate program. Information about PhD programs, including admissions, faculty, and fees, is outside my scope. My focus is specifically on undergraduate admissions and program details."
-}
+**Example 5: Time-Sensitive Query**
+*   User Query: "What are the latest research papers from MBZUAI?"
+*   Analysis:
+    ```json
+    {
+      "action": "rewrite",
+      "is_time_sensitive": true,
+      "rewritten_queries": {
+        "metadata_query": "latest research papers publications 2024 2025",
+        "natural_language_query": "What are the most recent research papers published by MBZUAI?"
+      },
+      "relevant_history_indices": []
+    }
+    ```
 
-Example 10 - Masters Program Out of Scope:
-User query: "What are the faculty members for the Master's program?"
-Analysis: {
-  "action": "respond",
-  "response": "I'm sorry, but information about MBZUAI's Master's programs, including faculty members, is outside my scope. I'm specifically designed to provide information about the undergraduate program at MBZUAI. If you have questions about undergraduate studies, I'd be happy to help with those."
-}
+**Example 6: Out of Scope**
+*   User Query: "What's the weather like?"
+*   Analysis:
+    ```json
+    {
+      "action": "respond",
+      "response": "I can only answer questions related to MBZUAI. How can I help you with its programs, research, or other university matters?"
+    }
+    ```
 
-Example 11 - General Programs Question (In Scope):
-User query: "What programs does MBZUAI offer?"
-Analysis: {
-  "action": "rewrite",
-  "rewritten_query": "What academic programs, including undergraduate and graduate-level programs, does MBZUAI offer?",
-  "relevant_history_indices": []
-}
-
-Example 12 - Mixed Graduate/Undergraduate Question:
-User query: "Compare the admission requirements for Masters and undergraduate programs"
-Analysis: {
-  "action": "rewrite",
-  "rewritten_query": "What are the admission requirements for MBZUAI's undergraduate program?",
-  "relevant_history_indices": []
-}
-
-Example 13 - Ambiguous Query:
-User query: "Tell me about Tim Baldwin"
-Analysis: {
-  "action": "rewrite",
-  "rewritten_query": "Tell me about Tim Baldwin from MBZUAI?",
-  "relevant_history_indices": []
-}
+--- 
 
 User query: {{query}}
 Language: {{language}}
@@ -182,67 +167,58 @@ Your analysis:
 
 async def query_rewriting_agent(question: str, language: str, message_history: List[dict]) -> dict:
     """
-    Processes the user query to either:
-    1. Rewrite it for better retrieval
-    2. Respond directly to out-of-scope or general queries
-    3. Respond to identity questions with a standard response
-    
-    Returns a dictionary with:
-    - action: "rewrite", "respond", or "identity" 
-    - rewritten_query: The improved query (if action is "rewrite")
-    - response: Direct response (if action is "respond" or "identity")
-    - relevant_history_indices: Indices of relevant messages in history (if action is "rewrite")
+    Processes the user's query to rewrite it into two specialized queries or provide a direct response.
+
+    Returns a dictionary containing the action and relevant data:
+    - For "rewrite": {"action": "rewrite", "rewritten_queries": {"metadata_query": str, "natural_language_query": str}, "relevant_history_indices": List[int]}
+    - For "respond"/"identity": {"action": str, "response": str}
     """
-    # Format the prompt with the actual values
-    formatted_history = json.dumps(message_history[-5:] if len(message_history) > 5 else message_history) if message_history else "[]"
+    formatted_history = json.dumps(message_history) if message_history else "[]"
     agent_prompt = query_agent_prompt.replace("{{query}}", question).replace("{{language}}", language).replace("{{message_history}}", formatted_history)
-    
+
     try:
-        # Call the LLM to analyze the query
         completion = await openai_client.chat.completions.create(
-            model="gpt-4o-mini-2024-07-18",  # Using a smaller model for efficiency
+            model="gpt-4.1-mini-2025-04-14",
             messages=[
                 {"role": "system", "content": agent_prompt},
-                {"role": "user", "content": "Analyze this query and determine the action to take. Provide your analysis in JSON format."}
+                {"role": "user", "content": "Analyze this query and provide your analysis in the specified JSON format."}
             ],
             temperature=0.1,
+            top_p=1,
             response_format={"type": "json_object"},
         )
-        
         result = json.loads(completion.choices[0].message.content)
-        
-        # Extract the action and related information
-        action = result.get("action", "rewrite")  # Default to rewrite if action is missing
-        
+        action = result.get("action", "rewrite")
+
         if action == "rewrite":
+            rewritten_queries = result.get("rewritten_queries", {})
             return {
                 "action": "rewrite",
-                "rewritten_query": result.get("rewritten_query", question),
-                "relevant_history_indices": result.get("relevant_history_indices", [])  # Get indices of relevant history messages
+                "is_time_sensitive": result.get("is_time_sensitive", False),
+                "rewritten_queries": {
+                    "metadata_query": rewritten_queries.get("metadata_query", question),
+                    "natural_language_query": rewritten_queries.get("natural_language_query", question)
+                },
+                "relevant_history_indices": result.get("relevant_history_indices", [])
             }
-        elif action == "respond":
+        elif action in ["clarify", "respond", "identity"]:
             return {
-                "action": "respond",
-                "response": result.get("response", "I can only answer questions related to MBZUAI's undergraduate program, including admissions, campus life, and other undergraduate matters.")
-            }
-        elif action == "identity":
-            return {
-                "action": "respond",
-                "response": "I am an AI assistant developed by lawa.ai, designed to provide accurate responses based on the provided context, strictly focused on MBZUAI admissions program."
+                "action": action,
+                "response": result.get("response", "I can only answer questions related to MBZUAI.")
             }
         else:
-            # Fallback for unexpected actions
+            # Fallback for any unexpected action
             return {
                 "action": "rewrite",
-                "rewritten_query": question,
+                "rewritten_queries": {"metadata_query": question, "natural_language_query": question},
                 "relevant_history_indices": []
             }
-            
+
     except Exception as e:
         logger.exception("Error in query rewriting agent:")
-        # On error, default to proceeding with the original query
+        # Fallback to using the original query for both indexes on error
         return {
             "action": "rewrite",
-            "rewritten_query": question,
+            "rewritten_queries": {"metadata_query": question, "natural_language_query": question},
             "relevant_history_indices": []
         }

@@ -8,7 +8,7 @@ def validate_citation_numbers(citation_numbers: List[int], max_docs: int) -> Lis
     """Validate that citation numbers are within the valid range"""
     return [num for num in citation_numbers if 1 <= num <= max_docs]
 
-def process_citations(complete_answer: str, ranked_docs: List[dict]) -> Tuple[str, List[dict]]:
+def process_citations(complete_answer: str, ranked_docs: List) -> Tuple[str, List[dict]]:
     """
     Extracts citation numbers from the answer, maps them to consecutive citation numbers,
     and returns the updated answer along with a list of citation sources.
@@ -42,7 +42,14 @@ def process_citations(complete_answer: str, ranked_docs: List[dict]) -> Tuple[st
     # Process valid citations and create mapping
     for num in valid_citations:
         try:
-            url = ranked_docs[num - 1]["page_source"]
+            doc = ranked_docs[num - 1]
+            # Handle both Document objects and dictionaries
+            if hasattr(doc, 'metadata'):
+                # Prioritize 'page_source' as it's the correct key for our documents
+                url = doc.metadata.get('page_source', doc.metadata.get('source', ''))
+            else:
+                # Fallback for dict-like objects, also prioritizing 'page_source'
+                url = doc.get('page_source', doc.get('source', ''))
             
             # Fix: URL-encode spaces and special characters in the URL
             # But preserve the structure of the URL itself

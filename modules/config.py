@@ -16,21 +16,37 @@ def setup_logging():
 
 logger = setup_logging()
 
-# Required environment variables
-required_env_vars = [
-    "PINECONE_API_KEY",
-    "PERPLEXITY_API_KEY",
-    "OPENAI_API_KEY"
-]
+# --- Essential API Keys and Configuration ---
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY") # Optional, but listed as required
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY") # Optional
 
-# Get RAG App Name from environment variables
-RAG_APP_NAME = os.getenv("RAG_APP_NAME", "default_rag_app")
+# --- Pinecone Index Configuration ---
+PINECONE_SUMMARY_INDEX_NAME = os.getenv("PINECONE_SUMMARY_INDEX_NAME")
+PINECONE_TEXT_INDEX_NAME = os.getenv("PINECONE_TEXT_INDEX_NAME")
 
-# Validate required environment variables
+# --- Application-Specific Configuration ---
+RAG_APP_NAME = os.getenv("RAG_APP_NAME", "Undergraduate")
+
+# --- Retrieval and Reranking Configuration ---
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+RETRIEVER_TOP_K = 15  # Number of documents to retrieve initially
+RERANKER_TOP_N = 7   # Number of documents to keep after reranking
+
+# Function to validate essential environment variables
 def validate_env_vars():
-    missing_vars = [var for var in required_env_vars if not os.getenv(var)]
+    essential_vars = {
+        "OpenAI API Key": OPENAI_API_KEY,
+        "Pinecone API Key": PINECONE_API_KEY,
+        "Pinecone Summary Index Name": PINECONE_SUMMARY_INDEX_NAME,
+        "Pinecone Text Index Name": PINECONE_TEXT_INDEX_NAME,
+    }
+    missing_vars = [name for name, value in essential_vars.items() if not value]
     if missing_vars:
-        raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+        message = f"Missing essential environment variables: {', '.join(missing_vars)}"
+        logger.error(message)
+        raise ValueError(message)
 
 # System prompt for the chat model
 def get_system_prompt():
@@ -80,7 +96,7 @@ def get_system_prompt():
 - **You must NEVER provide details about graduate-level admissions, faculty, compensation, students, or program specifics.**
 - **You must NEVER include information about other programs in your responses, even if you have access to it.**
 - **For questions specifically and exclusively about Masters or PhD programs, respond with:**  
-  🛑 *"The question is out of my scope. I can only answer questions related to MBZUAI's undergraduate program, including admissions, campus life, and other undergraduate matters."*  
+  🛑 *"It seems you're asking about a graduate program. This service provides information exclusively for the MBZUAI Undergraduate program. Can I help you with any questions about our undergraduate offerings?"*  
 - **You must NEVER answer questions unrelated to MBZUAI.**  
 - **Do not attempt to generate speculative, hypothetical, or external information.**  
 

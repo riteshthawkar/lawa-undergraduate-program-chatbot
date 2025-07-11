@@ -8,8 +8,12 @@ from pinecone import Pinecone, PineconeAsyncio
 from pinecone_text.sparse import BM25Encoder
 from langchain_community.retrievers import PineconeHybridSearchRetriever
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.documents import Document
 
-from modules.config import logger
+from modules.config import (
+    logger, RETRIEVER_TOP_K, RERANKER_TOP_N,
+    PINECONE_API_KEY, PINECONE_SUMMARY_INDEX_NAME, PINECONE_TEXT_INDEX_NAME
+)
 from pydantic import BaseModel
 import openai
 from datetime import datetime
@@ -26,24 +30,11 @@ class Document_reference(BaseModel):
 class Ranked_Documents(BaseModel):
     ranked_documents: List[Document_reference]
 
-# Initialize retrieval components
+# Configuration for retrieval components
 MAX_RETRIES = 3
 RETRY_DELAY = 1  # seconds
-PINECONE_INDEX = "final-mbzuai-index-2" # Ensure this index name is correct
-PINECONE_WEBPAGES_INDEX = "mbzuai-webpages-index-latest" # Define missing constant
-PINECONE_PDFS_INDEX = "mbzuai-pdfs-index-latest"       # Define missing constant
 BM25_FILE = "./MBZUAI_BM25_ENCODER.json" # Ensure this path is correct
-
-# Constants for pre-filtering before sending to LLM reranker
-NUM_WEBPAGES_TO_SELECT = 5
-NUM_PDFS_TO_SELECT = 3
-
-# New constants for balanced fetching
-TARGET_INITIAL_WEB_RESULTS = 20  # Number of webpages to fetch initially
-TARGET_INITIAL_PDF_RESULTS = 20  # Number of PDFs to fetch initially
-METADATA_FIELD_FOR_TYPE = "document_type" # Metadata field in Pinecone for document type
-METADATA_VALUE_WEBPAGE = "WEBPAGE"    # Value for webpage documents
-METADATA_VALUE_PDF = "PDF"            # Value for PDF documents
+HYBRID_ALPHA = 0.5 # Alpha for hybrid search (0.0 for sparse, 1.0 for dense)
 
 def get_reranker_system_prompt():
     current_date_str = datetime.now().strftime("%B %d, %Y")
@@ -196,10 +187,7 @@ def format_docs(docs: List[dict]) -> str:
 async def openai_rerank_and_filter_docs(query: str, original_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Reranks and filters documents using OpenAI's gpt-4o-mini model."""
     documents_for_llm = []
-    
     for i, doc in enumerate(original_docs):
-        # Assuming doc structure is like Langchain Document converted to dict
-        # {'page_content': '...', 'metadata': {'source': '...', 'title': '...'}}
         documents_for_llm.append({
             "page_source": doc.get("page_source", {}),
             "chunk": doc.get("chunk", "")
@@ -211,350 +199,215 @@ async def openai_rerank_and_filter_docs(query: str, original_docs: List[Dict[str
     try:
         formatted_docs = format_docs(documents_for_llm)
         llm_payload = f"User Query: {query}\n\n{formatted_docs}"
-        
-        # Check payload size if necessary, though gpt-4o-mini has a large context window
+
         response = await client.beta.chat.completions.parse(
             model="gpt-4.1-mini-2025-04-14",
             messages=[
                 {"role": "system", "content": get_reranker_system_prompt()},
                 {"role": "user", "content": llm_payload}
             ],
-            response_format=Ranked_Documents, # Request JSON output
-            temperature=0.1 # Low temperature for more deterministic ranking
+            response_format=Ranked_Documents,
+            temperature=0.1
         )
 
         llm_output_str = response.choices[0].message.content
         if not llm_output_str:
             logger.warning("OpenAI reranker returned empty content.")
-            return original_docs # Fallback
+            return original_docs
 
         logger.debug(f"Raw LLM output for reranking: {llm_output_str}")
-
         llm_response_dict = json.loads(llm_output_str)
 
         if not isinstance(llm_response_dict, dict):
-            logger.error(f"OpenAI reranker did not return a JSON object (dict) as expected. Got: {type(llm_response_dict)}")
-            return original_docs # Fallback
+            logger.error(f"OpenAI reranker did not return a JSON object. Got: {type(llm_response_dict)}")
+            return original_docs[:RERANKER_TOP_N]
 
         ranked_items = llm_response_dict.get("ranked_documents")
-
         if not isinstance(ranked_items, list):
-            logger.error(f"OpenAI reranker did not return a list under 'ranked_documents' key. Found: {type(ranked_items)}. Full response: {llm_response_dict}")
-            return original_docs # Fallback
+            logger.error(f"Reranker did not return a list under 'ranked_documents'. Found: {type(ranked_items)}.")
+            return original_docs[:RERANKER_TOP_N]
 
         final_ranked_docs = []
         seen_indices = set()
         for item in ranked_items:
             if not isinstance(item, dict) or "index" not in item or "source_url" not in item:
-                logger.warning(f"Invalid item format from OpenAI reranker: {item}")
+                logger.warning(f"Invalid item format from reranker: {item}")
                 continue
+            
             original_index = item.get("index")
             if isinstance(original_index, int) and 0 <= original_index < len(original_docs) and original_index not in seen_indices:
                 final_ranked_docs.append(original_docs[original_index])
                 seen_indices.add(original_index)
             else:
-                logger.warning(f"LLM reranker referred to an invalid or duplicate index: {original_index}")
+                logger.warning(f"Reranker referred to an invalid or duplicate index: {original_index}")
         
-        logger.info(f"OpenAI Reranker selected {len(final_ranked_docs)} out of {len(original_docs)} documents.")
+        logger.info(f"Reranked {len(original_docs)} docs down to {len(final_ranked_docs)}.")
         return final_ranked_docs
 
-    except json.JSONDecodeError:
-        logger.error("Failed to decode LLM reranker response as JSON.")
-        return original_docs # Fallback
-    except openai.APIError as e:
-        logger.error(f"OpenAI API error during reranking: {e}")
-        return original_docs # Fallback
     except Exception as e:
-        logger.exception(f"Unexpected error in openai_rerank_and_filter_docs: {e}")
-        return original_docs # Fallback
+        logger.error(f"An error occurred during OpenAI reranking: {e}")
+        return original_docs
 
-async def rerank_docs(query: str, docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]: # docs are Langchain-style dicts from app.py
+async def rerank_docs(query: str, docs: List[Dict[str, Any]], is_time_sensitive: bool = False) -> List[Dict[str, Any]]:
     """
-    Pre-filters documents to a specified number of webpages and PDFs, 
-    transforms them, then reranks them using the OpenAI LLM.
+    Selects, transforms, and reranks documents using a metadata-aware LLM reranker.
     """
     if not docs:
-        logger.info("rerank_docs received no documents to process.")
         return []
 
-    # 1. Separate incoming Langchain-style docs into webpage and PDF lists
-    webpage_lc_docs = []
-    pdf_lc_docs = []
-    for lc_doc in docs:
-        metadata = lc_doc.get("metadata")
-        doc_type = None
-        source_url_raw = None
+    # The reranker has a soft cap, so we send a reasonable number of initial docs.
+    docs_to_rerank = docs[:RERANKER_TOP_N]
+    logger.info(f"Sending {len(docs_to_rerank)} documents to the reranker.")
 
-        if metadata:
-            doc_type = metadata.get(METADATA_FIELD_FOR_TYPE)
-            source_url_raw = metadata.get("page_source")
-
-        if doc_type == METADATA_VALUE_WEBPAGE:
-            webpage_lc_docs.append(lc_doc)
-        elif doc_type == METADATA_VALUE_PDF:
-            pdf_lc_docs.append(lc_doc)
-        elif source_url_raw: # Fallback to URL check if source_type is missing/unknown but URL exists
-            source_url_lower = source_url_raw.lower()
-            if ".pdf" not in source_url_lower:
-                webpage_lc_docs.append(lc_doc)
-            else:
-                pdf_lc_docs.append(lc_doc)
-        else:
-            logger.warning(
-                f"Document could not be classified as webpage/PDF and has no source URL: {lc_doc.get('page_content', '')[:100]}..."
-            )
-    
-    logger.info(f"Initial separation: {len(webpage_lc_docs)} webpages, {len(pdf_lc_docs)} PDFs.")
-
-    # 2. Select top N from each list (still Langchain-style docs)
-    selected_lc_docs = []
-    selected_lc_docs.extend(webpage_lc_docs[:NUM_WEBPAGES_TO_SELECT])
-    selected_lc_docs.extend(pdf_lc_docs[:NUM_PDFS_TO_SELECT])
-
-    if not selected_lc_docs:
-        logger.info("No documents selected after web/PDF pre-filtering for LLM reranker.")
-        return []
-    
-    logger.info(f"Pre-filtered to {len(selected_lc_docs)} documents for LLM reranker input.")
-
-    # 3. Transform selected Langchain-style docs to the page_source/chunk format
-    #    that openai_rerank_and_filter_docs expects for its 'original_docs' parameter.
-    docs_for_llm_reranker_input = []
-    for lc_doc in selected_lc_docs:
-        page_source = ""
-        metadata = lc_doc.get("metadata")
-        if metadata:
-            page_source = metadata.get("page_source", metadata.get("source", ""))
-        
-        chunk_content = lc_doc.get("page_content", "") # Use 'page_content' for the chunk
-
-        docs_for_llm_reranker_input.append({
-            "page_source": page_source,
-            "chunk": chunk_content
-        })
-
-    # Log the documents being sent to the reranker
-    reranker_input_sources = [doc.get("page_source", "NO_URL_FOUND") for doc in docs_for_llm_reranker_input]
-    logger.info(f"Sending {len(reranker_input_sources)} docs to LLM reranker. Sources: {reranker_input_sources}")
-
-    # 4. Call the LLM reranker with the pre-filtered and transformed documents
-    try:
-        # openai_rerank_and_filter_docs now receives a list of {'page_source': ..., 'chunk': ...} dicts.
-        # It will handle creating the final prompt for the LLM, including adding indices.
-        llm_reranked_docs = await openai_rerank_and_filter_docs(query, docs_for_llm_reranker_input)
-
-        if not llm_reranked_docs:
-            logger.info("No documents returned after OpenAI reranking and filtering step.")
-            return []
-        
-        # The returned llm_reranked_docs are already in the desired format 
-        # (list of {'page_source': ..., 'chunk': ...} dicts, ranked by LLM)
-        # and filtered by the LLM.
-        reranker_output_sources = [doc.get("page_source", "NO_URL_FOUND") for doc in llm_reranked_docs]
-        logger.info(f"LLM reranker returned {len(reranker_output_sources)} docs. Sources: {reranker_output_sources}")
-        logger.info(f"rerank_docs returning {len(llm_reranked_docs)} documents after LLM processing.")
-        return llm_reranked_docs
-
-    except Exception as e:
-        logger.exception("Error during the main rerank_docs processing with OpenAI reranker:")
-        # Fallback: return the pre-selected (but not LLM-reranked) docs, or empty, or re-raise
-        # For now, returning the pre-filtered, transformed docs to avoid full failure.
-        # Consider if this is the best fallback (e.g., maybe return 'docs' or '[]').
-        return docs_for_llm_reranker_input 
+    # The is_time_sensitive flag is handled by the reranker's system prompt, not as an argument.
+    return await openai_rerank_and_filter_docs(query, docs_to_rerank)
 
 async def fetch_balanced_documents(
-    query: str, 
-    pc_client: Pinecone, 
-    embed_model: HuggingFaceEmbeddings, 
-    bm25_encoder: BM25Encoder, 
-    num_webpages: int = TARGET_INITIAL_WEB_RESULTS,
-    num_pdfs: int = TARGET_INITIAL_PDF_RESULTS
-) -> List[Dict[str, Any]]:
+    metadata_query: str,
+    natural_language_query: str,
+    pinecone_summary_index: Any, # pinecone.Index
+    pinecone_text_index: Any, # pinecone.Index
+    embed_model: HuggingFaceEmbeddings,
+    bm25_encoder: BM25Encoder,
+    num_summary_docs: int = RETRIEVER_TOP_K,
+    num_text_docs: int = RETRIEVER_TOP_K
+) -> List[Document]:
     """
-    Fetches a balanced set of webpage and PDF documents from Pinecone
-    by performing two separate, concurrent filtered queries.
-
-    Args:
-        query: The user's search query.
-        pc_client: Synchronous Pinecone client instance.
-        embed_model: Initialized HuggingFaceEmbeddings model.
-        bm25_encoder: Initialized BM25Encoder.
-        num_webpages: The target number of webpage documents to retrieve.
-        num_pdfs: The target number of PDF documents to retrieve.
-
-    Returns:
-        A list of unique documents (dictionaries) combined from both sources,
-        with 'page_content' and 'metadata' keys.
+    Retrieves documents from both summary and text indexes in Pinecone using hybrid search,
+    combining dense vectors and sparse BM25 vectors for improved retrieval.
+    Uses specifically tailored queries for each index.
     """
-    all_docs = []
-    try:
-        # Get Pinecone Index objects for webpages and PDFs
-        web_pinecone_index = pc_client.Index(PINECONE_WEBPAGES_INDEX)
-        pdf_pinecone_index = pc_client.Index(PINECONE_PDFS_INDEX)
-
-        # Create PineconeHybridSearchRetriever for webpages
-        web_retriever = PineconeHybridSearchRetriever(
+    async def query_hybrid_retriever(index, query, k):
+        retriever = PineconeHybridSearchRetriever(
+            index=index,
             embeddings=embed_model,
             sparse_encoder=bm25_encoder,
-            index=web_pinecone_index,
-            top_k=num_webpages, # Use num_webpages for top_k
-            alpha=0.6 
+            top_k=k,
+            alpha=HYBRID_ALPHA
         )
-
-        # Create PineconeHybridSearchRetriever for PDFs
-        pdf_retriever = PineconeHybridSearchRetriever(
-            embeddings=embed_model,
-            sparse_encoder=bm25_encoder,
-            index=pdf_pinecone_index,
-            top_k=num_pdfs, # Use num_pdfs for top_k
-            alpha=0.6
-        )
-
-        # Helper function to fetch documents from a given retriever
-        async def _get_relevant_documents_async(current_retriever: PineconeHybridSearchRetriever, current_query: str):
-            # No filter needed as indexes are type-specific
-            return await current_retriever.ainvoke(current_query) # Corrected method name
-
-        # Perform concurrent retrievals
-        tasks = [
-            _get_relevant_documents_async(web_retriever, query),
-            _get_relevant_documents_async(pdf_retriever, query)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Process results
-        webpage_docs_result = results[0]
-        pdf_docs_result = results[1]
-
-        webpage_docs = []
-        if isinstance(webpage_docs_result, Exception):
-            logger.error(f"Error fetching webpage documents for query '{query}': {webpage_docs_result}")
-        else:
-            for doc in webpage_docs_result:
-                doc.metadata[METADATA_FIELD_FOR_TYPE] = METADATA_VALUE_WEBPAGE
-                webpage_docs.append(doc)
-
-        pdf_docs = []
-        if isinstance(pdf_docs_result, Exception):
-            logger.error(f"Error fetching PDF documents for query '{query}': {pdf_docs_result}")
-        else:
-            for doc in pdf_docs_result:
-                doc.metadata[METADATA_FIELD_FOR_TYPE] = METADATA_VALUE_PDF
-                pdf_docs.append(doc)
-
-        # logger.info(f"Retrieved {len(webpage_docs)} webpages and {len(pdf_docs)} PDFs for query '{query}' before deduplication.")
-
-        # Combine and deduplicate documents
-        # Using a dictionary to store documents by a unique identifier (e.g., URL or a hash of content if URL is not always unique)
-        # to ensure uniqueness before converting to list of dicts.
-        # Langchain documents have a 'metadata' attribute which usually contains 'source'.
-        # We also need to handle potential lack of 'source' or if it's not a good unique key.
-        # For now, let's assume 'source' in metadata is a URL and can be used for deduplication.
-        # If not, a more robust content-based hashing might be needed.
-
-        unique_docs_by_source = {}
-
-        for doc in webpage_docs + pdf_docs:
-            source = doc.metadata.get('source', '') 
-            # If source is missing or empty, use a hash of page_content for uniqueness.
-            # This is a simple way, might need more robust handling.
-            unique_key = source if source else str(hash(doc.page_content))
-            if unique_key not in unique_docs_by_source:
-                unique_docs_by_source[unique_key] = doc
-
-        # Convert Langchain Document objects to dictionaries
-        unique_docs_as_dicts = [
-            {"page_content": doc.page_content, "metadata": doc.metadata} 
-            for doc in unique_docs_by_source.values()
-        ]
-        
-        # logger.info(f"Returning {len(unique_docs_as_dicts)} unique documents for query '{query}'.")
-        return unique_docs_as_dicts
-
-    except Exception as e:
-        logger.exception(f"Error in fetch_balanced_documents for query '{query}': {e}")
-        return [] # Return empty list on error
-
-async def tavily_search(question: str) -> List[dict]:
-    """Fallback search using Tavily API"""
-    try:
-        # Get API key from environment
-        api_key = os.getenv("TAVILY_API_KEY")
-        url = "https://api.tavily.com/search"
-        payload = {
-            "query": question,
-            "search_depth": "advanced",
-            "topic": "general",
-            "max_results": 5,
-            "include_answer": False,
-            "include_raw_content": True,
-        }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.post(url, json=payload, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        results = data.get("results", [])
-        result_docs = []
-        for result in results:
-            obj = {
-                "page_source": result.get("url", ""),
-                "chunk": result.get("raw_content", "")
-            }
-            result_docs.append(obj)
-        return result_docs
-    except Exception as e:
-        logger.exception("Error in tavily_search:")
-        # In production you might return an empty list or a fallback response.
-        return [] 
-
-def initialize_pinecone():
-    """Initialize the Pinecone retriever with retries"""
-    api_key = os.getenv("PINECONE_API_KEY")
-    pc = Pinecone(api_key=api_key)
-    async_pc = PineconeAsyncio(api_key=api_key)
-    
-    for attempt in range(MAX_RETRIES):
         try:
-            # Index object is no longer created here directly for a single index
-            bm25 = BM25Encoder().load(BM25_FILE)
-            
-            embed_model = HuggingFaceEmbeddings(
-                model_name="Snowflake/snowflake-arctic-embed-l-v2.0",
-                model_kwargs={"trust_remote_code": True}
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, 
+                retriever.get_relevant_documents, 
+                query
             )
-            
-            # Return components instead of a pre-configured retriever
-            return embed_model, bm25, pc, async_pc
-            
         except Exception as e:
-            logger.warning(f"Pinecone initialization attempt {attempt + 1} failed: {e}")
-            if attempt == MAX_RETRIES - 1:
-                logger.exception("Failed to initialize Pinecone after multiple attempts.")
-                raise
-            time.sleep(2 ** attempt)
+            logger.error(f"Error during hybrid search on index {index.name} for query '{query}': {e}")
+            return []
 
-def initialize_pinecone_with_embeddings(embed_model):
-    """Initialize the Pinecone retriever with a pre-initialized embedding model"""
-    api_key = os.getenv("PINECONE_API_KEY")
-    # Initialize both sync and async clients
-    pc = Pinecone(api_key=api_key)
-    async_pc = PineconeAsyncio(api_key=api_key)
+    try:
+        logger.info(f"Querying summary index with: '{metadata_query}'")
+        logger.info(f"Querying text index with: '{natural_language_query}'")
+
+        summary_task = query_hybrid_retriever(pinecone_summary_index, metadata_query, num_summary_docs)
+        text_task = query_hybrid_retriever(pinecone_text_index, natural_language_query, num_text_docs)
+
+        results = await asyncio.gather(summary_task, text_task, return_exceptions=True)
+
+        all_docs = []
+        if isinstance(results[0], list):
+            logger.info(f"Retrieved {len(results[0])} documents from summary index using hybrid search.")
+            all_docs.extend(results[0])
+        else:
+            logger.error(f"Error querying summary index with hybrid search: {results[0]}")
+
+        if isinstance(results[1], list):
+            logger.info(f"Retrieved {len(results[1])} documents from text index using hybrid search.")
+            all_docs.extend(results[1])
+        else:
+            logger.error(f"Error querying text index with hybrid search: {results[1]}")
+
+        unique_docs = {}
+        skipped_count = 0
+        for doc in all_docs:
+            # Use page_id as the primary deduplication key
+            page_id = doc.metadata.get('page_id')
+
+            
+            if not page_id:
+                # Fallback to page_source + chunk_id if page_id is not available
+                page_id = f"{doc.metadata.get('page_source', '')}_{doc.metadata.get('chunk_id', '')}"
+            
+            if page_id not in unique_docs:
+                unique_docs[page_id] = doc
+            else:
+                skipped_count += 1
+        
+        final_docs = list(unique_docs.values())
+        logger.info(f"Deduplication: Started with {len(all_docs)} total documents")
+        logger.info(f"Deduplication: Skipped {skipped_count} duplicate documents")
+        logger.info(f"Returning {len(final_docs)} unique documents after deduplication.")
+        return final_docs
+
+    except Exception as e:
+        logger.exception("An error occurred during balanced document fetching.")
+        # Propagate the exception to be handled by the caller
+        raise
+
+def format_docs_for_llm_prompt(docs: List[Dict[str, Any]]) -> str:
+    """
+    Formats a list of documents into a string suitable for an LLM prompt.
+    """
+    formatted_docs = []
+    for i, doc in enumerate(docs):
+        page_content = doc.page_content if isinstance(doc, Document) else doc.get('page_content', '')
+        metadata = doc.metadata if isinstance(doc, Document) else doc.get('metadata', {})
+
+        title = metadata.get("document_title", "No Title Available")
+        summary = metadata.get("document_summary", "No Summary Available")
+        keywords = metadata.get("keywords", "[]")
+        source = metadata.get("page_source", metadata.get("source", "N/A"))
+        
+        if isinstance(keywords, str):
+            try:
+                keywords_list = json.loads(keywords.replace("'", '"'))
+                keywords_str = ", ".join(keywords_list)
+            except json.JSONDecodeError:
+                keywords_str = keywords
+        elif isinstance(keywords, list):
+            keywords_str = ", ".join(keywords)
+        else:
+            keywords_str = "None"
+
+        doc_str = (
+            f"========\n"
+            f"**ORIGINAL_INDEX:** {i}\n"
+            f"**DOCUMENT_SOURCE:** {source}\n"
+            f"**DOCUMENT_TITLE:** {title}\n"
+            f"**DOCUMENT_SUMMARY:** {summary}\n"
+            f"**KEYWORDS:** {keywords_str}\n"
+            f"**DOCUMENT_CONTENT:**\n{page_content}\n"
+            f"========"
+        )
+        formatted_docs.append(doc_str)
     
-    for attempt in range(MAX_RETRIES):
-        try:
-            # Index object is no longer created here directly for a single index
-            bm25 = BM25Encoder().load(BM25_FILE)
-            
-            # Return components (bm25, pc, async_pc) as embed_model is already provided
-            return bm25, pc, async_pc
-            
-        except Exception as e:
-            logger.warning(f"Pinecone initialization attempt {attempt + 1} failed: {e}")
-            if attempt == MAX_RETRIES - 1:
-                logger.exception("Failed to initialize Pinecone after multiple attempts.")
-                raise
-            time.sleep(2 ** attempt)
+    return "\n".join(formatted_docs) 
+
+def initialize_pinecone_clients():
+    """Initializes and returns the Pinecone index clients."""
+    logger.info("Initializing Pinecone clients...")
+    try:
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        summary_index = pc.Index(PINECONE_SUMMARY_INDEX_NAME)
+        text_index = pc.Index(PINECONE_TEXT_INDEX_NAME)
+        logger.info("Pinecone clients initialized successfully.")
+        return summary_index, text_index
+    except Exception as e:
+        logger.exception("Failed to initialize Pinecone clients.")
+        raise e
+
+def initialize_retrieval_components():
+    """Initializes and returns the embedding model and BM25 encoder."""
+    logger.info("Initializing retrieval components...")
+    try:
+        embed_model = HuggingFaceEmbeddings(
+            model_name="Qwen/Qwen3-Embedding-0.6B",
+            model_kwargs={"trust_remote_code": True}
+        )
+        bm25_encoder = BM25Encoder().load(BM25_FILE)
+        logger.info("Retrieval components initialized successfully.")
+        return embed_model, bm25_encoder
+    except Exception as e:
+        logger.exception("Failed to initialize retrieval components.")
+        raise
