@@ -49,7 +49,7 @@ def process_citations(complete_answer: str, ranked_docs: List) -> Tuple[str, Lis
                 url = doc.metadata.get('page_source', doc.metadata.get('source', ''))
             else:
                 # Fallback for dict-like objects, also prioritizing 'page_source'
-                url = doc.get('page_source', doc.get('source', ''))
+                url = doc.get('metadata', {}).get('page_source', doc.get('metadata', {}).get('source', ''))
             
             # Fix: URL-encode spaces and special characters in the URL
             # But preserve the structure of the URL itself

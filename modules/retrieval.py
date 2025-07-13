@@ -25,7 +25,7 @@ client = openai.AsyncOpenAI(api_key=api_key)
 
 class Document_reference(BaseModel):
     index: int
-    source_url: str
+    source: str
 
 class Ranked_Documents(BaseModel):
     ranked_documents: List[Document_reference]
@@ -122,7 +122,7 @@ def get_reranker_system_prompt():
 
     Each item in the list should be a dictionary with the following fields:
     - `"index"`: Original index of the document.
-    - `"source_url"`: URL or source identifier.
+    - `"source"`: URL or source identifier.
 
     Only include documents that:
     - **Clearly and directly help answer the query**.
@@ -140,11 +140,11 @@ def get_reranker_system_prompt():
     "ranked_documents": [
         {
         "index": 0,
-        "source_url": "https://mbzuai.ac.ae/research/latest-initiatives"
+        "source": "https://mbzuai.ac.ae/research/latest-initiatives"
         },
         {
         "index": 2,
-        "source_url": "https://mbzuai.ac.ae/study/admission-process"
+        "source": "https://mbzuai.ac.ae/study/admission-process"
         }
     ]
     }
@@ -161,7 +161,7 @@ def get_reranker_system_prompt():
 
 class Document_reference(BaseModel):
     index: int
-    source_url: str
+    source: str
 
 class Ranked_Documents(BaseModel):
     ranked_documents: List[Document_reference]
@@ -188,9 +188,20 @@ async def openai_rerank_and_filter_docs(query: str, original_docs: List[Dict[str
     """Reranks and filters documents using OpenAI's gpt-4o-mini model."""
     documents_for_llm = []
     for i, doc in enumerate(original_docs):
+        # Handle both nested metadata and direct metadata formats
+        if 'metadata' in doc and isinstance(doc['metadata'], dict):
+            # Format from app.py's docs_for_reranking
+            # Use page_source for URL as indicated by user
+            source = doc['metadata'].get('page_source', doc['metadata'].get('source', 'N/A'))
+            content = doc.get('page_content', '')
+        else:
+            # Direct format
+            source = doc.get('page_source', doc.get('source', 'N/A'))
+            content = doc.get('page_content', doc.get('chunk', ''))
+            
         documents_for_llm.append({
-            "page_source": doc.get("page_source", {}),
-            "chunk": doc.get("chunk", "")
+            "source": source,
+            "chunk": content
         })
 
     if not documents_for_llm:
@@ -215,23 +226,30 @@ async def openai_rerank_and_filter_docs(query: str, original_docs: List[Dict[str
             logger.warning("OpenAI reranker returned empty content.")
             return original_docs
 
-        logger.debug(f"Raw LLM output for reranking: {llm_output_str}")
-        llm_response_dict = json.loads(llm_output_str)
+        logger.debug("Raw LLM output for reranking: %s", llm_output_str)
+        
+        # Safer JSON parsing
+        try:
+            llm_response_dict = json.loads(llm_output_str)
+        except json.JSONDecodeError as e:
+            logger.error("Failed to parse reranker output as JSON: %s", e)
+            logger.error("Problematic output: %r", llm_output_str)
+            return original_docs[:RERANKER_TOP_N]
 
         if not isinstance(llm_response_dict, dict):
-            logger.error(f"OpenAI reranker did not return a JSON object. Got: {type(llm_response_dict)}")
+            logger.error("OpenAI reranker did not return a JSON object. Got: %s", type(llm_response_dict))
             return original_docs[:RERANKER_TOP_N]
 
         ranked_items = llm_response_dict.get("ranked_documents")
         if not isinstance(ranked_items, list):
-            logger.error(f"Reranker did not return a list under 'ranked_documents'. Found: {type(ranked_items)}.")
+            logger.error("Reranker did not return a list under 'ranked_documents'. Found: %s", type(ranked_items))
             return original_docs[:RERANKER_TOP_N]
 
         final_ranked_docs = []
         seen_indices = set()
         for item in ranked_items:
-            if not isinstance(item, dict) or "index" not in item or "source_url" not in item:
-                logger.warning(f"Invalid item format from reranker: {item}")
+            if not isinstance(item, dict) or "index" not in item or "source" not in item:
+                logger.warning("Invalid item format from reranker: %r", item)
                 continue
             
             original_index = item.get("index")
@@ -239,28 +257,38 @@ async def openai_rerank_and_filter_docs(query: str, original_docs: List[Dict[str
                 final_ranked_docs.append(original_docs[original_index])
                 seen_indices.add(original_index)
             else:
-                logger.warning(f"Reranker referred to an invalid or duplicate index: {original_index}")
+                logger.warning("Reranker referred to an invalid or duplicate index: %r", original_index)
         
-        logger.info(f"Reranked {len(original_docs)} docs down to {len(final_ranked_docs)}.")
+        logger.info("Reranked %d docs down to %d.", len(original_docs), len(final_ranked_docs))
         return final_ranked_docs
 
     except Exception as e:
-        logger.error(f"An error occurred during OpenAI reranking: {e}")
-        return original_docs
+        logger.error("An error occurred during OpenAI reranking: %s", str(e))
+        # Fallback: prioritize web pages over PDFs
+        web_pages = []
+        pdfs = []
+        for doc in original_docs:
+            source = doc.get("metadata", {}).get("source", "").lower()
+            if ".pdf" in source:
+                pdfs.append(doc)
+            else:
+                web_pages.append(doc)
+        
+        fallback_docs = (web_pages + pdfs)[:RERANKER_TOP_N]
+        logger.info("Reranker failed. Returning prioritized fallback documents.")
+        return fallback_docs
 
 async def rerank_docs(query: str, docs: List[Dict[str, Any]], is_time_sensitive: bool = False) -> List[Dict[str, Any]]:
     """
-    Selects, transforms, and reranks documents using a metadata-aware LLM reranker.
+    Reranks documents using an OpenAI model.
     """
     if not docs:
         return []
 
-    # The reranker has a soft cap, so we send a reasonable number of initial docs.
-    docs_to_rerank = docs[:RERANKER_TOP_N]
-    logger.info(f"Sending {len(docs_to_rerank)} documents to the reranker.")
-
     # The is_time_sensitive flag is handled by the reranker's system prompt, not as an argument.
-    return await openai_rerank_and_filter_docs(query, docs_to_rerank)
+    reranked_docs = await openai_rerank_and_filter_docs(query, docs)
+
+    return reranked_docs
 
 async def fetch_balanced_documents(
     metadata_query: str,
