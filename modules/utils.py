@@ -1,7 +1,7 @@
 import logging
 import asyncio
 from fastapi import WebSocket, WebSocketDisconnect
-from typing import List, Dict, Any
+from typing import List, Dict
 
 from modules.config import logger
 
@@ -16,53 +16,39 @@ async def safe_send(websocket: WebSocket, message: dict):
         logger.exception("Error sending message:")
         raise
 
-def format_docs(docs: List[Dict[str, Any]]) -> str:
-    """Formats a list of documents for use in a prompt, safely handling curly braces."""
-    doc_strings = []
-    for i, doc in enumerate(docs):
-        # Use .format() to avoid issues with curly braces in the document chunk
-        template = "- Document {index} (Source: {source}):\n{chunk}"
-        # Handle both Document objects and dictionaries for backward compatibility if needed
-        if hasattr(doc, 'metadata'): # It's a Document object
+def format_docs(docs: List) -> str:
+    """Format documents for inclusion in prompt. Works with LangChain Document objects."""
+    context = ""
+    for index, doc in enumerate(docs):
+        # Get source from metadata if available
+        # Prefer page_source when present as it is canonical in this codebase
+        if hasattr(doc, 'metadata'):
             source = doc.metadata.get('page_source', doc.metadata.get('source', 'N/A'))
-            content = doc.page_content
-        else: # It's a dictionary
-            source = doc.get('metadata', {}).get('page_source', doc.get('metadata', {}).get('source', 'N/A'))
-            content = doc.get('page_content', doc.get('chunk', ''))
-
-        doc_strings.append(template.format(
-            index=i + 1,
-            source=source,
-            chunk=content
-        ))
-    return "\n".join(doc_strings)
-
-def format_query(query: str, language: str, formatted_docs: str) -> str:
-    """Formats the user query with context from documents."""
-    return f"Answer the user's query in {language} based on the following context:\n\n{formatted_docs}\n\nUser Query: {query}"
-
-async def deduplicate_documents(documents):
-    """
-    Deduplicates a list of LangChain Document objects based on page_content.
-
-    Args:
-        documents (list): A list of LangChain Document objects.
-
-    Returns:
-        list: A new list containing unique Document objects.
-    """
-    logger.info(f"Deduplication: Started with {len(documents)} total documents")
-    seen_content = set()
-    unique_docs = []
-    skipped_count = 0
-
-    for doc in documents:
-        if doc.page_content not in seen_content:
-            seen_content.add(doc.page_content)
-            unique_docs.append(doc)
         else:
-            skipped_count += 1
+            source = 'N/A'
+        
+        context += f"\n{'=' * 75}\n"
+        context += f"**DOCUMENT CITATION INDEX:** {index + 1}\n"
+        context += f"**DOCUMENT SOURCE:** {source}\n\n"
+        
+        # Get content from page_content for Document objects or context field for dict-like objects
+        content = ""
+        if hasattr(doc, 'page_content'):
+            content = doc.page_content
+        elif hasattr(doc, 'context'):
+            content = doc.context
+        else:
+            # Fallback for dict-like objects
+            content = doc.get('context', doc.get('chunk', doc.get('page_content', 'N/A')))
+            
+        context += f"**CONTENT:**\n{content}\n"
     
-    logger.info(f"Deduplication: Skipped {skipped_count} duplicate documents")
-    logger.info(f"Returning {len(unique_docs)} unique documents after deduplication.")
-    return unique_docs 
+    if context: 
+        context += f"{'=' * 75}\n"
+
+    return context
+
+def format_query(query: str, language: str, docs: List[dict]) -> str:
+    """Format the query with language and document context"""
+    formatted_docs = format_docs(docs)
+    return f"**USER QUERY:** {query}\n**LANGUAGE:** {language}\n**CONTEXT:**\n{formatted_docs}" 

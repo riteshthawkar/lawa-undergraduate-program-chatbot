@@ -5,7 +5,8 @@ class ChatRequest(BaseModel):
     """Request model for chat endpoints"""
     question: str = Field(..., max_length=1024)
     language: str
-    previous_chats: List[dict] = []
+    # Use default_factory to avoid shared mutable defaults
+    previous_chats: List[dict] = Field(default_factory=list)
 
 class CitationSource(BaseModel):
     """Model for citation sources"""

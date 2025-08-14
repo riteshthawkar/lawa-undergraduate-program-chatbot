@@ -7,15 +7,18 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
+from langchain_huggingface import HuggingFaceEmbeddings
 
 # Import modules
-from modules.config import logger, validate_env_vars, get_system_prompt, RAG_APP_NAME
-from modules.schemas import ChatRequest
-from modules.utils import safe_send, format_query, deduplicate_documents, format_docs
+from modules.config import logger, validate_env_vars, get_system_prompt, RAG_APP_NAME, OPENAI_TIMEOUT
+from modules.schemas import ChatRequest, CitationSource
+from modules.utils import safe_send, format_query
 from modules.citations import process_citations
-from modules.retrieval import initialize_pinecone_clients, initialize_retrieval_components, rerank_docs, fetch_balanced_documents
+from modules.retrieval import initialize_retrieval_components, rerank_docs, fetch_balanced_documents
+from pinecone import Pinecone
 from modules.query_rewriting import query_rewriting_agent, openai_client
 
 # Import database modules
@@ -28,139 +31,391 @@ from modules.database.views import router as history_router
 # ------------------------------------------------------------------------------
 validate_env_vars()
 
+
+
 # ------------------------------------------------------------------------------
 # Lifespan manager for database connection pool
 # ------------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Application startup: Connecting to database...")
+    # Startup: Initialize all components
+    logger.info("Application startup: Initializing components...")
+    
+    # --- Database Connection ---
     pool = await connect_db()
-    logger.info("Application startup: Initializing database schema...")
     await init_db(pool)
     app.state.pool = pool
-    yield
-    logger.info("Application shutdown: Disconnecting from database...")
+    logger.info("Database pool initialized and assigned to app.state.")
+
+    # --- Retrieval Components (Embeddings, BM25) ---
+    app.state.embed_model, app.state.bm25_encoder = initialize_retrieval_components()
+    logger.info("Embedding model and BM25 encoder initialized and assigned to app.state.")
+
+    # --- Pinecone Client and Async Indexes ---
+    pinecone_api_key = os.getenv("PINECONE_API_KEY")
+    pc = Pinecone(api_key=pinecone_api_key)
+    
+    summary_index_name = os.getenv("PINECONE_SUMMARY_INDEX_NAME", "mbzuai-summary-only-index-latest")
+    text_index_name = os.getenv("PINECONE_TEXT_INDEX_NAME", "mbzuai-text-only-index-latest")
+
+    logger.info(f"Connecting to Pinecone indexes: '{summary_index_name}' and '{text_index_name}'...")
+    app.state.pinecone_summary_index = pc.Index(summary_index_name)
+    app.state.pinecone_text_index = pc.Index(text_index_name)
+    logger.info("Pinecone async index objects created and assigned to app.state.")
+
+    yield # Application runs here
+
+    # Shutdown: Disconnect from all services
+    logger.info("Application shutdown: Cleaning up resources...")
     await disconnect_db(app.state.pool)
+    logger.info("Database connection pool closed.")
+    # Note: pinecone-client > 4.0.0 does not require explicit close for indexes.
 
 # ------------------------------------------------------------------------------
-# Initialize FastAPI app
+# Initialize FastAPI app with CORS middleware and lifespan manager
 # ------------------------------------------------------------------------------
 app = FastAPI(lifespan=lifespan)
 
+# CORS configuration
+cors_env = os.getenv("CORS_ALLOW_ORIGINS", "*")
+allow_origins = [o.strip() for o in cors_env.split(",") if o.strip()] if cors_env != "*" else ["*"]
+allow_credentials = False if allow_origins == ["*"] else True
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=True,
+    allow_origins=allow_origins,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ------------------------------------------------------------------------------
-# Initialize retrieval components and Pinecone clients
+# Setup static files and templates
 # ------------------------------------------------------------------------------
-embed_model, bm25_encoder = initialize_retrieval_components()
-pinecone_summary_index, pinecone_text_index = initialize_pinecone_clients()
-logger.info("Retrieval components and Pinecone clients initialized successfully.")
+# Get the directory of the current file
+base_dir = os.path.dirname(os.path.abspath(__file__))
 
+# ------------------------------------------------------------------------------
+# Include database history router (endpoints within will need async updates too)
+# ------------------------------------------------------------------------------
 app.include_router(history_router, prefix="/api")
 
 # ------------------------------------------------------------------------------
-# WebSocket endpoint for chat functionality
+# WebSocket endpoint for chat functionality with improved error handling
 # ------------------------------------------------------------------------------
 @app.websocket("/chat")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("New client connected")
+    # Notify frontend that the connection is established
+    try:
+        await safe_send(websocket, {"status": "connected", "message": "Connected to assistant."})
+    except Exception:
+        pass
     
     while True:
         try:
+            # Wait for client messages without a timeout
             data = await websocket.receive_json()
+            # Inform the client we received the request
+            await safe_send(websocket, {"status": "received", "message": "Request received. Preparing to process..."})
             
+            # --- Feedback Handling --- 
             if "feedback" in data and "id" in data:
-                # Handle feedback separately
-                chat_id_str = data.get("id")
-                feedback = data.get("feedback")
-                if chat_id_str and feedback in ["like", "dislike"]:
-                    logger.info(f"Received feedback '{feedback}' for chat ID: {chat_id_str}")
-                    success = await ChatRepository.update_feedback(app.state.pool, chat_id_str, feedback)
-                    await safe_send(websocket, {"status": f"feedback_{'updated' if success else 'failed'}", "id": chat_id_str})
-                else:
-                    logger.warning(f"Invalid feedback data received: id={chat_id_str}, feedback={feedback}")
-                continue
+                try:
+                    chat_id_str = data.get("id") 
+                    feedback = data.get("feedback")
+                    
+                    if chat_id_str and feedback in ["like", "dislike"]:
+                        logger.info(f"Received feedback '{feedback}' for chat ID: {chat_id_str}")
+                        success = await ChatRepository.update_feedback(websocket.app.state.pool, chat_id_str, feedback)
+                        if success:
+                            await safe_send(websocket, {"status": "feedback_updated", "id": chat_id_str})
+                        else:
+                            await safe_send(websocket, {"status": "feedback_failed", "id": chat_id_str})
+                    else:
+                        # Invalid feedback content, but it was intended as feedback
+                        logger.warning(f"Invalid feedback data received: id={chat_id_str}, feedback={feedback}")
+                        await safe_send(websocket, {"status": "invalid_feedback_data", "id": chat_id_str})
+                
+                except Exception as feedback_err:
+                    # Error during feedback processing
+                    logger.exception(f"Error processing feedback: {feedback_err}")
+                    await safe_send(websocket, {"status": "feedback_error", "id": data.get('id', 'unknown')})
+                
+                # Skip to the next message if it was feedback (processed or error)
+                continue 
+            
+            # --- Chat Message Handling (only if not feedback) ---
+            try:
+                chat_request = ChatRequest(**data)
+            except ValidationError as ve:
+                error_details = str(ve)
+                logger.exception(f"Validation error: {error_details}")
+                await safe_send(websocket, {
+                    "response": f"Invalid request format. Please ensure your message contains the required fields: question, language, and previous_chats.", 
+                    "error": "validation_error",
+                    "error_details": error_details,
+                    "sources": []
+                })
+                continue # Skip processing this invalid message
 
-            chat_request = ChatRequest(**data)
             question = chat_request.question
             language = chat_request.language
             previous_chats = chat_request.previous_chats
 
+            # Apply query rewriting agent to analyze and possibly rewrite the query
             agent_result = await query_rewriting_agent(question, language, previous_chats)
-
+            
+            # Handle direct responses (out of scope, clarification requests, or identity questions)
             if agent_result["action"] in ["respond", "clarify", "identity"]:
+                # Generate a unique string ID for this chat
                 chat_str_id = str(uuid.uuid4())
-                await safe_send(websocket, {"response": agent_result["response"], "sources": [], "id": chat_str_id})
-                asyncio.create_task(ChatRepository.save_chat(app.state.pool, question, agent_result["response"], [], chat_str_id, RAG_APP_NAME))
+                
+                # Send the response to the client with the string ID
+                await safe_send(websocket, {
+                    "response": agent_result["response"], 
+                    "sources": [],
+                    "id": chat_str_id  # Include the string ID with the response
+                })
+                
+                # Save the query-rewriting agent's response to the database
+                try:
+                    # Save to the database using our custom string ID
+                    chat_id = await ChatRepository.save_chat(app.state.pool, question, agent_result["response"], [], chat_str_id, RAG_APP_NAME)
+                    logger.info(f"Query-rewriting agent response saved to database with numeric ID: {chat_id}, string ID: {chat_str_id}, and app: {RAG_APP_NAME}")
+                except Exception as e:
+                    logger.exception(f"Failed to save query-rewriting agent response to database: {e}")
+                
                 continue
+                
+            # The agent returns two specialized queries. Use them for retrieval.
+            metadata_query = agent_result.get("metadata_query", question)
+            natural_language_query = agent_result.get("natural_language_query", question)
+            logger.info(f"Using Metadata Query: '{metadata_query}' and Natural Language Query: '{natural_language_query}'")
 
-            # Extract the rewritten queries from the nested structure
+            # Filter previous chat messages based on relevance
+            relevant_history = []
+            if "relevant_history_indices" in agent_result and previous_chats:
+                indices = agent_result["relevant_history_indices"]
+                
+                # Create a set to track which indices to include (including assistants' responses)
+                indices_to_include = set()
+                
+                # Include each relevant message index
+                for idx in indices:
+                    if 0 <= idx < len(previous_chats):
+                        indices_to_include.add(idx)
+                        # If this is a user message and there's an assistant response right after,
+                        # include the assistant's response too
+                        if idx + 1 < len(previous_chats) and previous_chats[idx]["role"] == "user" and previous_chats[idx + 1]["role"] == "assistant":
+                            indices_to_include.add(idx + 1)
+                
+                # Sort the indices to maintain conversation order
+                sorted_indices = sorted(indices_to_include)
+                
+                # Get relevant messages in order
+                relevant_history = [previous_chats[i] for i in sorted_indices]
+                
+                # Log the filtering of message history
+                if len(relevant_history) < len(previous_chats):
+                    logger.info(f"Filtered message history from {len(previous_chats)} to {len(relevant_history)} relevant messages")
+            else:
+                # If no relevance info or no previous chats, use empty history
+                relevant_history = []
+            
+            await safe_send(websocket, {"status": "rewriting", "message": "Analyzing and optimizing your question for best results..."})
+            start_time_retrieval = time.time()
+
+            # Leverage the previously computed agent_result
+            if agent_result.get("action") != "rewrite":
+                await safe_send(websocket, {"type": "final_answer", "response": agent_result.get("response", "..."), "sources": []})
+                return
+
             rewritten_queries = agent_result.get("rewritten_queries", {})
+            metadata_query = rewritten_queries.get("metadata_query", question)
             natural_language_query = rewritten_queries.get("natural_language_query", question)
-            metadata_query = rewritten_queries.get("metadata_query", natural_language_query)
-            
-            logger.info("Rewritten Query (WebSocket): %s", natural_language_query)
-            logger.info("Metadata Query (WebSocket): %s", metadata_query)
+            logger.info(f"Rewritten queries generated: metadata='{metadata_query}', natural_language='{natural_language_query}'")
+            await safe_send(websocket, {"status": "rewritten", "message": "Your question has been optimized. Searching knowledge base..."})
 
-            retrieved_docs = await fetch_balanced_documents(
-                metadata_query=metadata_query,
-                natural_language_query=natural_language_query,
-                pinecone_summary_index=pinecone_summary_index,
-                pinecone_text_index=pinecone_text_index,
-                embed_model=embed_model,
-                bm25_encoder=bm25_encoder
-            )
-            deduplicated_docs = await deduplicate_documents(retrieved_docs)
-            
-            retrieved_urls = [doc.metadata.get('page_source', 'N/A') for doc in deduplicated_docs]
-            logger.info("Retrieved %d documents (WebSocket): %s", len(deduplicated_docs), retrieved_urls)
+            # Step 3: Fetch documents from Pinecone using the rewritten queries
+            logger.info("Step 3: Fetching documents from Pinecone...")
+            await safe_send(websocket, {"status": "retrieving", "message": "Searching our knowledge base for relevant documents..."})
+            try:
+                docs = await fetch_balanced_documents(
+                    rewritten_queries=rewritten_queries,
+                    pinecone_summary_index=websocket.app.state.pinecone_summary_index,
+                    pinecone_text_index=websocket.app.state.pinecone_text_index,
+                    embed_model=websocket.app.state.embed_model,
+                    bm25_encoder=websocket.app.state.bm25_encoder
+                )
+                if not docs:
+                    logger.warning("No documents found in Pinecone.")
+                    await safe_send(websocket, {"status": "not_found", "message": "I couldn’t find enough MBZUAI-specific information to answer that. Try rephrasing with more details (for example: program name, semester, or deadline)."})
+                    return
 
-            ranked_docs = []
-            if deduplicated_docs:
-                docs_for_reranking = []
-                for doc in deduplicated_docs:
-                    new_metadata = doc.metadata.copy()
-                    new_metadata['source'] = new_metadata.get('page_source', 'N/A')
-                    docs_for_reranking.append({"page_content": doc.page_content, "metadata": new_metadata})
+            except Exception as e:
+                logger.exception("Failed to fetch documents from Pinecone.")
+                await safe_send(websocket, {"status": "error", "message": "I’m having trouble retrieving information right now. Please try again later."})
+                return
 
-                ranked_docs = await rerank_docs(natural_language_query, docs_for_reranking, agent_result.get("is_time_sensitive", False))
-                final_doc_urls = [doc.get('metadata', {}).get('source', 'N/A') for doc in ranked_docs]
-                logger.info("Final %d documents for LLM (WebSocket): %s", len(ranked_docs), final_doc_urls)
+            end_time_retrieval = time.time()
+            retrieval_time = end_time_retrieval - start_time_retrieval
+            logger.info(f"[PERF] Initial retrieval took {retrieval_time:.4f} seconds.")
+            logger.info(f"Retrieved {len(docs)} documents initially for query: {rewritten_queries}")
 
-            if not ranked_docs:
-                await safe_send(websocket, {"response": "I couldn't find any relevant information to answer your question.", "sources": [], "id": str(uuid.uuid4())})
-                continue
+            # Log the sources of the initial documents for debugging
+            if docs:
+                logger.info("--- Documents After Deduplication (Before Reranking) ---")
+                for i, doc in enumerate(docs):
+                    source = doc.metadata.get('page_source', 'N/A')
+                    title = doc.metadata.get('title', 'N/A')
+                    logger.info(f"Doc {i+1}: Source: {source}, Title: {title}")
+                logger.info("-------------------------------------------------------")
 
-            formatted_docs = format_docs(ranked_docs)
-            relevant_history = [previous_chats[i] for i in agent_result.get("relevant_history_indices", []) if 0 <= i < len(previous_chats)]
-            messages = [{"role": "system", "content": get_system_prompt()}] + relevant_history + [{"role": "user", "content": format_query(question, language, formatted_docs)}]
+            await safe_send(websocket, {"status": "reranking", "message": f"Found {len(docs)} documents. Ranking them by relevance..."})
+
+            # Rerank documents
+            if docs:
+                is_time_sensitive = agent_result.get("is_time_sensitive", False)
+                ranked_docs = await rerank_docs(natural_language_query, docs, is_time_sensitive=is_time_sensitive)
+                logger.info(f"Reranked and received {len(ranked_docs)} documents from rerank_docs.")
+            else:
+                ranked_docs = [] # No docs to rerank
+            await safe_send(websocket, {"status": "reranked", "message": f"Selected top {len(ranked_docs)} most relevant documents."})
+
+            # Log the sources of the reranked documents for debugging
+            if ranked_docs:
+                logger.info("--- Documents Provided to Response Generation ---")
+                for i, doc in enumerate(ranked_docs):
+                    source = doc.metadata.get('page_source', 'N/A')
+                    title = doc.metadata.get('title', 'N/A')
+                    logger.info(f"Doc {i+1}: Source: {source}, Title: {title}")
+                logger.info("-------------------------------------------------")
+
+            await safe_send(websocket, {"status": "generating", "message": "Generating a detailed answer based on the top documents..."})
+
+            # Prepare the conversation messages
+            messages = [{"role": "system", "content": get_system_prompt()}]
+            messages.extend(relevant_history)  # Use only the relevant history
+            messages.append({"role": "user", "content": format_query(question, language, ranked_docs)})
 
             complete_answer = ""
-            async for chunk in await openai_client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.1, stream=True):
-                delta_content = chunk.choices[0].delta.content
-                if delta_content:
-                    complete_answer += delta_content
-                    await safe_send(websocket, {"response": delta_content})
-            
-            updated_answer, citations = process_citations(complete_answer, ranked_docs)
+            chunk_buffer = ""
+            isResponseAvailable = True
+
+            # Generate and stream the chat response
+            try:
+                completion = await openai_client.chat.completions.create(
+                    model="chatgpt-4o-latest",
+                    messages=messages,
+                    temperature=0,
+                    max_tokens=1024,
+                    stream=True,
+                    timeout=OPENAI_TIMEOUT,
+                )
+                # Inform the client that streaming has started
+                await safe_send(websocket, {"status": "streaming", "message": "Composing your answer..."})
+                async for chunk in completion:
+                    delta_content = chunk.choices[0].delta.content
+                    if delta_content:
+                        if "🛑" in delta_content:
+                            isResponseAvailable = False
+                            break
+                        complete_answer += delta_content
+                        # Remove inline citation markers from the streamed chunk before sending
+                        cleaned_content = re.sub(r'\[\d+\]', '', delta_content)
+                        chunk_buffer += cleaned_content
+                        if len(chunk_buffer) >= 1:
+                            await safe_send(websocket, {"response": chunk_buffer})
+                            chunk_buffer = ""
+                if chunk_buffer:
+                    await safe_send(websocket, {"response": chunk_buffer})
+            except Exception as e:
+                error_details = str(e)
+                error_type = type(e).__name__
+                logger.exception(f"Error during streaming: {error_details}")
+                
+                # Provide more specific error messages based on error type
+                if "rate limit" in error_details.lower():
+                    error_message = "I’m receiving too many requests right now. Please try again shortly."
+                    error_code = "rate_limit_exceeded"
+                elif "timeout" in error_details.lower():
+                    error_message = "This is taking longer than expected. Please try again with a simpler or more specific question."
+                    error_code = "request_timeout"
+                else:
+                    error_message = "I ran into an issue while generating a response. Please try again later."
+                    error_code = "generation_error"
+                
+                await safe_send(websocket, {
+                    "response": error_message,
+                    "error": error_code,
+                    "error_details": error_details,
+                    "status": "error",
+                    "sources": []
+                })
+                continue
+
+            # If the response indicates no answer available, send a clear message and stop.
+            if not isResponseAvailable:
+                await safe_send(websocket, {
+                    "response": "I couldn’t generate a confident answer right now. Try rephrasing with more details (e.g., program, year, topic) or ask a simpler version.",
+                    "sources": []
+                })
+                continue
+
+            # Process citations (run sync function in thread)
+            await safe_send(websocket, {"status": "finalizing", "message": "Finalizing answer and formatting citations..."})
+            updated_answer, citations = await asyncio.to_thread(
+                process_citations, complete_answer, ranked_docs
+            )
+
+            # Generate a unique string ID for this chat
             chat_str_id = str(uuid.uuid4())
-            # The frontend expects a final message with the complete, updated answer.
-            await safe_send(websocket, {"response": updated_answer, "sources": citations, "id": chat_str_id, "is_final": True})
-            asyncio.create_task(ChatRepository.save_chat(app.state.pool, question, updated_answer, citations, chat_str_id, RAG_APP_NAME))
+
+            # Send the response to the client with the string ID immediately
+            await safe_send(websocket, {
+                "response": updated_answer,
+                "sources": citations,
+                "id": chat_str_id  # Include the string ID with the response
+            })
+            # Signal completion
+            await safe_send(websocket, {"status": "done", "message": "Answer ready."})
+
+            # Save chat to DB asynchronously using await
+            try:
+                # Await the async save_chat method
+                chat_id = await ChatRepository.save_chat(app.state.pool, question, updated_answer, citations, chat_str_id, RAG_APP_NAME)
+                if chat_id:
+                    logger.info(f"Chat saved to database with numeric ID: {chat_id}, string ID: {chat_str_id}, and app: {RAG_APP_NAME}")
+                else:
+                    logger.error(f"Failed to save chat (string ID: {chat_str_id}) to database.")
+            except Exception as db_err:
+                logger.exception(f"Database error saving chat (string ID: {chat_str_id}): {db_err}")
 
         except WebSocketDisconnect:
             logger.info("Client disconnected")
             break
         except Exception as e:
-            logger.exception(f"Error in websocket endpoint: {e}")
-            await safe_send(websocket, {"response": "An error occurred.", "sources": []})
+            error_details = str(e)
+            error_type = type(e).__name__
+            logger.exception(f"Unexpected error in websocket endpoint: {error_type} - {error_details}")
+            
+            try:
+                # Provide a more detailed error message with a unique error ID for tracking
+                error_id = f"err-{int(time.time())}"
+                error_message = f"An unexpected error occurred (ID: {error_id}). Our team has been notified and is working to resolve it."
+                
+                await safe_send(websocket, {
+                    "response": error_message,
+                    "error": "unexpected_error",
+                    "error_id": error_id,
+                    "sources": []
+                })
+                
+                # Log the error with the error ID for easier tracking
+                logger.error(f"Error ID {error_id}: {error_type} - {error_details}")
+            except Exception as send_error:
+                logger.info(f"Could not send error message as websocket appears to be closed: {str(send_error)}")
             break
 
 # ------------------------------------------------------------------------------
@@ -168,63 +423,153 @@ async def websocket_endpoint(websocket: WebSocket):
 # ------------------------------------------------------------------------------
 @app.post("/telegram-chat")
 async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundTasks):
+    # Extract the question and language from the validated request body.
+    logger.info(f"Received telegram chat request: {chat_request}")
+    
+    question = chat_request.question
+    language = chat_request.language
+    previous_chats = chat_request.previous_chats
+
+    # Apply query rewriting agent to analyze and possibly rewrite the query
+    agent_result = await query_rewriting_agent(question=question, language=language, message_history=previous_chats)
+    
+    # Handle direct responses (out of scope or clarification requests)
+    if agent_result["action"] in ["respond", "clarify"]:
+        return {
+            "response": agent_result["response"],
+            "sources": []
+        }
+        
+    # The agent returns two specialized queries. Use them for retrieval.
+    metadata_query = agent_result.get("metadata_query", question)
+    natural_language_query = agent_result.get("natural_language_query", question)
+    logger.info(f"Using Metadata Query: '{metadata_query}' and Natural Language Query: '{natural_language_query}'")
+
+    # Filter previous chat messages based on relevance
+    relevant_history = []
+    if "relevant_history_indices" in agent_result and previous_chats:
+        indices = agent_result["relevant_history_indices"]
+        indices_to_include = set()
+        for idx in indices:
+            if 0 <= idx < len(previous_chats):
+                indices_to_include.add(idx)
+                if idx + 1 < len(previous_chats) and previous_chats[idx]["role"] == "user" and previous_chats[idx + 1]["role"] == "assistant":
+                    indices_to_include.add(idx + 1)
+        sorted_indices = sorted(indices_to_include)
+        relevant_history = [previous_chats[i] for i in sorted_indices]
+        if len(relevant_history) < len(previous_chats):
+            logger.info(f"Filtered message history from {len(previous_chats)} to {len(relevant_history)} relevant messages")
+    else:
+        relevant_history = []
+    
+    start_time_retrieval = time.time()
+
+    # Step 3: Fetch initial documents from Pinecone
+    logger.info("Step 3: Fetching documents from Pinecone...")
     try:
-        question = chat_request.question
-        language = chat_request.language
-        previous_chats = chat_request.previous_chats
-
-        agent_result = await query_rewriting_agent(question, language, previous_chats)
-
-        if agent_result["action"] in ["respond", "clarify"]:
-            return {"response": agent_result["response"], "sources": []}
-
-        # Extract the rewritten queries from the nested structure
-        rewritten_queries = agent_result.get("rewritten_queries", {})
-        rewritten_query = rewritten_queries.get("natural_language_query", question)
-        metadata_query = rewritten_queries.get("metadata_query", rewritten_query)
-        
-        logger.info(f"Rewritten Query (Telegram): '{rewritten_query}'")
-        logger.info(f"Metadata Query (Telegram): '{metadata_query}'")
-
-        retrieved_docs = await fetch_balanced_documents(
-            metadata_query=metadata_query,
-            natural_language_query=rewritten_query,
-            pinecone_summary_index=pinecone_summary_index,
-            pinecone_text_index=pinecone_text_index,
-            embed_model=embed_model,
-            bm25_encoder=bm25_encoder
+        docs = await fetch_balanced_documents(
+            rewritten_queries=agent_result.get("rewritten_queries", {}),
+            pinecone_summary_index=app.state.pinecone_summary_index,
+            pinecone_text_index=app.state.pinecone_text_index,
+            embed_model=app.state.embed_model,
+            bm25_encoder=app.state.bm25_encoder
         )
-        deduplicated_docs = await deduplicate_documents(retrieved_docs)
-
-        retrieved_urls = [doc.metadata.get('source', 'N/A') for doc in deduplicated_docs]
-        logger.info(f"Retrieved {len(deduplicated_docs)} documents (Telegram): {retrieved_urls}")
-
-        ranked_docs = []
-        if deduplicated_docs:
-            docs_for_reranking = [{"page_content": doc.page_content, "metadata": doc.metadata} for doc in deduplicated_docs]
-            ranked_docs = await rerank_docs(rewritten_query, docs_for_reranking, agent_result.get("is_time_sensitive", False))
-            final_doc_urls = [doc['metadata'].get('source', 'N/A') for doc in ranked_docs]
-            logger.info(f"Final {len(ranked_docs)} documents for LLM (Telegram): {final_doc_urls}")
-
-        if not ranked_docs:
-            return {"response": "No relevant information found to answer your question.", "sources": []}
-
-        relevant_history = [previous_chats[i] for i in agent_result.get("relevant_history_indices", []) if 0 <= i < len(previous_chats)]
-        messages = [{"role": "system", "content": get_system_prompt()}] + relevant_history + [{"role": "user", "content": format_query(question, language, ranked_docs)}]
-
-        completion = await openai_client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.1, stream=False)
-        complete_answer = completion.choices[0].message.content
-        
-        updated_answer, citations = process_citations(complete_answer, ranked_docs)
-        chat_str_id = str(uuid.uuid4())
-
-        background_tasks.add_task(ChatRepository.save_chat, app.state.pool, question, updated_answer, citations, chat_str_id, RAG_APP_NAME)
-
-        return {"response": updated_answer, "sources": citations, "id": chat_str_id}
-
+        if not docs:
+            logger.warning("No documents found in Pinecone for the query.")
+            return JSONResponse(
+                status_code=404,
+                content={"response": "Sorry, I couldn't find any relevant information to answer your question.", "sources": [], "id": str(uuid.uuid4())}
+            )
     except Exception as e:
-        logger.exception(f"Error in telegram-chat endpoint: {e}")
-        return {"response": "An error occurred.", "sources": []}
+        logger.exception("Failed to fetch documents from Pinecone.")
+        return JSONResponse(
+            status_code=500,
+            content={"response": "Something went wrong. Please try again.", "sources": [], "id": str(uuid.uuid4())}
+        )
+
+    end_time_retrieval = time.time()
+    retrieval_time = end_time_retrieval - start_time_retrieval
+    logger.info(f"[PERF] Initial retrieval took {retrieval_time:.4f} seconds.")
+    logger.info(f"Retrieved {len(docs)} documents initially for query: {natural_language_query}")
+
+    # Rerank documents
+    if docs:
+        ranked_docs = await rerank_docs(natural_language_query, docs)
+        logger.info(f"Reranked and received {len(ranked_docs)} documents from rerank_docs.")
+    else:
+        ranked_docs = [] # No docs to rerank
+
+    if not ranked_docs:
+        return {
+            "response": "No relevant information found to answer your question.",
+            "sources": []
+        }
+
+    # Prepare the conversation messages.
+    messages = [{"role": "system", "content": get_system_prompt()}]
+    messages.extend(relevant_history)  # Use only the relevant history
+    messages.append({"role": "user", "content": format_query(question, language, ranked_docs)})
+
+    complete_answer = ""
+    isResponseAvailable = True
+
+    # Generate and stream the chat response.
+    try:
+        completion = await openai_client.chat.completions.create(
+            model="chatgpt-4o-latest",
+            messages=messages,
+            temperature=0,
+            max_tokens=1024,
+            stream=True,
+            timeout=OPENAI_TIMEOUT,
+        )
+        cleaned_answer = ""
+        async for chunk in completion:
+            delta_content = chunk.choices[0].delta.content
+            if delta_content:
+                if "🛑" in delta_content:
+                    isResponseAvailable = False
+                    break
+                complete_answer += delta_content
+                # Remove inline citation markers from the streamed chunk and store it
+                cleaned_content = re.sub(r'\[\d+\]', '', delta_content)
+                cleaned_answer += cleaned_content
+    except Exception as e:
+        logger.exception("Error during streaming response:")
+        return {
+            "response": "Response generation failed. Please try again later.",
+            "sources": []
+        }
+
+    # If the initial response indicates no answer, return a clear failure message.
+    if not isResponseAvailable:
+        return {
+            "response": "I couldn’t generate a confident answer right now. Try rephrasing with more details (e.g., program, year, topic) or ask a simpler version.",
+            "sources": []
+        }
+
+    # Process citations after streaming completes (run sync function in thread)
+    if isResponseAvailable:
+        updated_answer, citations = await asyncio.to_thread(
+            process_citations, complete_answer, ranked_docs
+        )
+    else:
+        # Handle case where no response was generated (e.g., fallback search failed)
+        updated_answer, citations = complete_answer, []
+
+    # Generate a unique string ID for this chat
+    chat_str_id = str(uuid.uuid4())
+    
+    # Save chat asynchronously without blocking response
+    try:
+        asyncio.create_task(
+            ChatRepository.save_chat(app.state.pool, question, updated_answer, citations, chat_str_id, RAG_APP_NAME)
+        )
+    except Exception as e:
+        logger.exception(f"Failed to schedule chat save task: {e}")
+
+    # Return the response immediately without waiting for database operation
+    return {"response": updated_answer, "sources": citations, "id": chat_str_id}
 
 # ------------------------------------------------------------------------------
 # Health check endpoint
@@ -232,3 +577,61 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
 @app.get("/", response_class=JSONResponse)
 async def root():
     return JSONResponse(content={"status": "working"})
+
+
+@app.get("/api", response_class=JSONResponse)
+async def api_root():
+    return JSONResponse(content={"message": "API is working"})
+
+@app.get("/health")
+async def health(request: Request):
+    # Add a database connection check
+    db_status = "connected"
+    db_message = "Database connection successful."
+    pool = request.app.state.pool
+    if not pool or getattr(pool, "closed", False):
+         db_status = "disconnected"
+         db_message = "Database pool is closed or not initialized."
+    else:
+        try:
+            # Try a simple query
+            async with pool.acquire() as conn:
+                await conn.fetchval('SELECT 1')
+        except Exception as db_err:
+            logger.error(f"Database health check failed: {db_err}")
+            db_status = "error"
+            db_message = f"Database connection error: {str(db_err)[:100]}..."
+            
+    try:
+        # Check if components are loaded in app.state
+        if not hasattr(request.app.state, 'embed_model') or not request.app.state.embed_model:
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": "Embedding model not initialized"}
+            )
+        
+        if not hasattr(request.app.state, 'pinecone_summary_index') or not hasattr(request.app.state, 'pinecone_text_index'):
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": "Pinecone indexes not initialized"}
+            )
+            
+        # Return success if all checks pass
+        return JSONResponse(
+            content={
+                "status": "healthy",
+                "message": "API is operational",
+                "components": {
+                    "embedding_model": "initialized",
+                    "pinecone": "connected",
+                    "database": db_status
+                }
+            },
+            media_type="application/json"
+        )
+    except Exception as e:
+        logger.exception("Health check failed:")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)}
+        )

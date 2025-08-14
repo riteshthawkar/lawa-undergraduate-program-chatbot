@@ -75,7 +75,7 @@ async def init_db(pool: Optional[asyncpg.Pool]) -> None:
                     query TEXT NOT NULL,
                     response TEXT NOT NULL,
                     timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    feedback TEXT CHECK(feedback IN ('like', 'dislike', NULL)),
+                    feedback TEXT CHECK (feedback IN ('like','dislike') OR feedback IS NULL),
                     id_str TEXT UNIQUE,
                     rag_app_name TEXT
                 )

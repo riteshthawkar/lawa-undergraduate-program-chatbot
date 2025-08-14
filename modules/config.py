@@ -1,5 +1,8 @@
+
+
 import os
 import logging
+from datetime import datetime
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -16,37 +19,39 @@ def setup_logging():
 
 logger = setup_logging()
 
-# --- Essential API Keys and Configuration ---
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY") # Optional, but listed as required
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY") # Optional
+# Required environment variables
+# Keep minimal to avoid blocking startup on unused providers
+required_env_vars = [
+    "PINECONE_API_KEY",
+    "OPENAI_API_KEY",
+]
 
-# --- Pinecone Index Configuration ---
-PINECONE_SUMMARY_INDEX_NAME = os.getenv("PINECONE_SUMMARY_INDEX_NAME")
-PINECONE_TEXT_INDEX_NAME = os.getenv("PINECONE_TEXT_INDEX_NAME")
+# Get RAG App Name from environment variables
+RAG_APP_NAME = os.getenv("RAG_APP_NAME", "default_rag_app")
 
-# --- Application-Specific Configuration ---
-RAG_APP_NAME = os.getenv("RAG_APP_NAME", "Undergraduate")
+# --- RAG Pipeline Configuration ---
+# Number of documents to retrieve from each Pinecone index
+RETRIEVAL_K = int(os.getenv("RETRIEVAL_K", 10))
+# The number of top reranked documents to pass to the final LLM for answer generation
+RERANKER_TOP_N = int(os.getenv("RERANKER_TOP_N", 8))
 
-# --- Retrieval and Reranking Configuration ---
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-RETRIEVER_TOP_K = 15  # Number of documents to retrieve initially
-RERANKER_TOP_N = 7   # Number of documents to keep after reranking
+# The total number of documents to send to the reranker from the initial retrieval pool
+TOTAL_DOCS_TO_RERANK = int(os.getenv("TOTAL_DOCS_TO_RERANK", 20))
 
-# Function to validate essential environment variables
+# OpenAI request timeout (seconds)
+OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "30"))
+
+# Hybrid search weighting and embedding model configuration
+HYBRID_ALPHA = float(os.getenv("HYBRID_ALPHA", "0.5"))
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "Qwen/Qwen3-Embedding-0.6B")
+BM25_FILE_PATH = os.getenv("BM25_FILE_PATH", "./MBZUAI_BM25_ENCODER.json")
+
+# Validate required environment variables
 def validate_env_vars():
-    essential_vars = {
-        "OpenAI API Key": OPENAI_API_KEY,
-        "Pinecone API Key": PINECONE_API_KEY,
-        "Pinecone Summary Index Name": PINECONE_SUMMARY_INDEX_NAME,
-        "Pinecone Text Index Name": PINECONE_TEXT_INDEX_NAME,
-    }
-    missing_vars = [name for name, value in essential_vars.items() if not value]
+    missing_vars = [var for var in required_env_vars if not os.getenv(var)]
     if missing_vars:
-        message = f"Missing essential environment variables: {', '.join(missing_vars)}"
-        logger.error(message)
-        raise ValueError(message)
+        raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+
 
 # System prompt for the chat model
 def get_system_prompt():

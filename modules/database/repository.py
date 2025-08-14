@@ -54,7 +54,7 @@ class ChatRepository:
                     if not chat_record:
                         raise Exception("Failed to insert chat record or retrieve ID.")
                         
-                    chat_id = chat_record['id']
+                        chat_id = chat_record["id"]
                     
                     # Insert sources if any
                     if sources:
@@ -233,15 +233,14 @@ class ChatRepository:
                 sources = [Source(url=row['url'], cite_num=row['cite_num']) for row in source_rows]
                 
                 return ChatHistoryEntry(
-                    id=chat_row['id'],
-                    query=chat_row['query'],
-                    response=chat_row['response'],
+                    id=chat_row["id"],
+                    query=chat_row["query"],
+                    response=chat_row["response"],
                     sources=sources,
-                    timestamp=chat_row['timestamp'],
-                    feedback=chat_row['feedback'],
-                    id_str=chat_row['id_str'],
-                    rag_app_name=chat_row.get('rag_app_name') # Use .get for safety
-
+                    timestamp=chat_row["timestamp"],
+                    feedback=chat_row["feedback"],
+                    id_str=chat_row["id_str"],
+                    rag_app_name=(chat_row["rag_app_name"] if (isinstance(chat_row, dict) and "rag_app_name" in chat_row) or (hasattr(chat_row, "keys") and "rag_app_name" in chat_row.keys()) else None)
                 )
             except asyncpg.PostgresError as e:
                 logger.error(f"Error retrieving chat ID {chat_id}: {e}")
@@ -288,7 +287,7 @@ class ChatRepository:
                     return []
                 
                 # Fetch sources for all retrieved chat IDs in a single query for efficiency
-                chat_ids = [row['id'] for row in chat_rows]
+                chat_ids = [row["id"] for row in chat_rows]
                 all_source_rows = await conn.fetch(
                     "SELECT chat_id, url, cite_num FROM sources WHERE chat_id = ANY($1::int[])",
                     chat_ids
@@ -297,24 +296,24 @@ class ChatRepository:
                 # Group sources by chat_id
                 sources_by_chat_id = {}
                 for src_row in all_source_rows:
-                    chat_id = src_row['chat_id']
+                    chat_id = src_row["chat_id"]
                     if chat_id not in sources_by_chat_id:
                         sources_by_chat_id[chat_id] = []
-                    sources_by_chat_id[chat_id].append(Source(url=src_row['url'], cite_num=src_row['cite_num']))
+                    sources_by_chat_id[chat_id].append(Source(url=src_row["url"], cite_num=src_row["cite_num"]))
 
                 # Build the final list of ChatHistoryEntry objects
                 for chat_row in chat_rows:
-                    chat_id = chat_row['id']
+                    chat_id = chat_row["id"]
                     sources = sources_by_chat_id.get(chat_id, []) # Get sources or empty list
                     result.append(ChatHistoryEntry(
                         id=chat_id,
-                        query=chat_row['query'],
-                        response=chat_row['response'],
+                        query=chat_row["query"],
+                        response=chat_row["response"],
                         sources=sources,
-                        timestamp=chat_row['timestamp'],
-                        feedback=chat_row['feedback'],
-                        id_str=chat_row['id_str'], # Include id_str
-                        rag_app_name=chat_row.get('rag_app_name') # Use .get for safety
+                        timestamp=chat_row["timestamp"],
+                        feedback=chat_row["feedback"],
+                        id_str=chat_row["id_str"], # Include id_str
+                        rag_app_name=(chat_row["rag_app_name"] if (isinstance(chat_row, dict) and "rag_app_name" in chat_row) or (hasattr(chat_row, "keys") and "rag_app_name" in chat_row.keys()) else None)
                     ))
                 
                 return result

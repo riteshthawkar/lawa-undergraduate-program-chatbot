@@ -2,7 +2,7 @@ import json
 import os
 from typing import List, Dict
 from openai import AsyncOpenAI
-from modules.config import logger
+from modules.config import logger, OPENAI_TIMEOUT
 
 # Initialize OpenAI client
 openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -150,6 +150,7 @@ Previous messages: {{message_history}}
 Your analysis:
 """
 
+
 async def query_rewriting_agent(question: str, language: str, message_history: List[dict]) -> dict:
     """
     Processes the user's query to rewrite it into two specialized queries or provide a direct response.
@@ -163,7 +164,7 @@ async def query_rewriting_agent(question: str, language: str, message_history: L
 
     try:
         completion = await openai_client.chat.completions.create(
-            model="gpt-4.1-mini-2025-04-14",
+            model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": agent_prompt},
                 {"role": "user", "content": "Analyze this query and provide your analysis in the specified JSON format."}
@@ -171,6 +172,7 @@ async def query_rewriting_agent(question: str, language: str, message_history: L
             temperature=0.1,
             top_p=1,
             response_format={"type": "json_object"},
+            timeout=OPENAI_TIMEOUT,
         )
         result = json.loads(completion.choices[0].message.content)
         action = result.get("action", "rewrite")

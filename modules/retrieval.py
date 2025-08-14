@@ -1,28 +1,35 @@
 import asyncio
-import time
-import httpx
 import os
 import json
 from typing import List, Dict, Any
-from pinecone import Pinecone, PineconeAsyncio
-from pinecone_text.sparse import BM25Encoder
-from langchain_community.retrievers import PineconeHybridSearchRetriever
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_pinecone import PineconeVectorStore
 from langchain_core.documents import Document
+from langchain_huggingface import HuggingFaceEmbeddings
+from pinecone_text.sparse import BM25Encoder
+from langchain_community.retrievers.pinecone_hybrid_search import PineconeHybridSearchRetriever
+from pydantic import BaseModel
+import httpx
+from datetime import datetime
+from openai import AsyncOpenAI
 
 from modules.config import (
-    logger, RETRIEVER_TOP_K, RERANKER_TOP_N,
-    PINECONE_API_KEY, PINECONE_SUMMARY_INDEX_NAME, PINECONE_TEXT_INDEX_NAME
+    logger,
+    RETRIEVAL_K,
+    RERANKER_TOP_N,
+    TOTAL_DOCS_TO_RERANK,
+    OPENAI_TIMEOUT,
+    HYBRID_ALPHA,
+    EMBEDDING_MODEL_NAME,
+    BM25_FILE_PATH,
 )
-from pydantic import BaseModel
-import openai
-from datetime import datetime
 
+# --- OpenAI Client Initialization ---
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     logger.error("OPENAI_API_KEY not found in environment variables.")
-client = openai.AsyncOpenAI(api_key=api_key)
+client = AsyncOpenAI(api_key=api_key)
 
+# --- Pydantic Models for Type Hinting and Validation ---
 class Document_reference(BaseModel):
     index: int
     source: str
@@ -30,18 +37,20 @@ class Document_reference(BaseModel):
 class Ranked_Documents(BaseModel):
     ranked_documents: List[Document_reference]
 
-# Configuration for retrieval components
+# --- Constants ---
 MAX_RETRIES = 3
 RETRY_DELAY = 1  # seconds
-BM25_FILE = "./MBZUAI_BM25_ENCODER.json" # Ensure this path is correct
-HYBRID_ALPHA = 0.5 # Alpha for hybrid search (0.0 for sparse, 1.0 for dense)
+BM25_FILE = BM25_FILE_PATH
 
-def get_reranker_system_prompt():
+# --- Reranker System Prompt ---
+def get_reranker_system_prompt(is_time_sensitive: bool = False):
     current_date_str = datetime.now().strftime("%B %d, %Y")
-    return f"""
+
+    return (
+        """
     As an AI assistant developed by MBZUAI (Mohamed Bin Zayed University of Artificial Intelligence), your task is to re-rank a list of retrieved documents based on their **strict relevance and reliability** to a user's query related to MBZUAI undergraduate program. The objective is to help the response-generation LLM select only the **most accurate, timely, detailed, and MBZUAI undergraduate program-specific** documents.
 
-        **Current Date:** {current_date_str}
+        **Current Date:** """ + current_date_str + """
 
     ---
 
@@ -148,7 +157,7 @@ def get_reranker_system_prompt():
         }
     ]
     }
-    ````
+    ```
 
     Do **not** include document content in the output.
     Do **not** summarize or answer the query.
@@ -156,178 +165,113 @@ def get_reranker_system_prompt():
 
     Focus purely on **ranking based on MBZUAI relevance, recency, specificity, and authority**.
     """
+    )
 
 
 
-class Document_reference(BaseModel):
-    index: int
-    source: str
-
-class Ranked_Documents(BaseModel):
-    ranked_documents: List[Document_reference]
-
-def format_docs(docs: List[dict]) -> str:
-    """Format documents for inclusion in prompt"""
-    context = ""
-    for index, ele in enumerate(docs):
-        doc_type = "PDF" if ele.get("page_source") and ".pdf" in ele["page_source"].lower() else "Webpage"
-        
-        context += f"**ORIGINAL_INDEX:** {index}\n"
-        context += f"**DOCUMENT_SOURCE:** {ele.get('page_source', 'N/A')}\n"
-        context += f"**DOCUMENT_TYPE:** {doc_type}\n\n"
-        
-        # Removed blanket PDF warning
-            
-        context += f"**DOCUMENT_CONTENT:**\n{ele.get('chunk', 'N/A')}\n"
-        context += f"\n{'=' * 75}\n"
-    if context: 
-        context += f"{'=' * 75}\n"
-    return context
-
-async def openai_rerank_and_filter_docs(query: str, original_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Reranks and filters documents using OpenAI's gpt-4o-mini model."""
-    documents_for_llm = []
-    for i, doc in enumerate(original_docs):
-        # Handle both nested metadata and direct metadata formats
-        if 'metadata' in doc and isinstance(doc['metadata'], dict):
-            # Format from app.py's docs_for_reranking
-            # Use page_source for URL as indicated by user
-            source = doc['metadata'].get('page_source', doc['metadata'].get('source', 'N/A'))
-            content = doc.get('page_content', '')
-        else:
-            # Direct format
-            source = doc.get('page_source', doc.get('source', 'N/A'))
-            content = doc.get('page_content', doc.get('chunk', ''))
-            
-        documents_for_llm.append({
-            "source": source,
-            "chunk": content
-        })
-
-    if not documents_for_llm:
+# --- Reranking Function ---
+async def openai_rerank_and_filter_docs(query: str, original_docs: List[Dict[str, Any]], is_time_sensitive: bool = False) -> List[Dict[str, Any]]:
+    """
+    Reranks and filters documents using OpenAI's gpt-4o-mini model.
+    """
+    if not original_docs:
         return []
 
-    try:
-        formatted_docs = format_docs(documents_for_llm)
-        llm_payload = f"User Query: {query}\n\n{formatted_docs}"
+    formatted_docs_str = format_docs_for_llm_prompt(original_docs)
+    system_prompt = get_reranker_system_prompt(is_time_sensitive=is_time_sensitive)
+    user_prompt = f"User Query: \"{query}\"\n\nDocuments:\n{formatted_docs_str}"
 
-        response = await client.beta.chat.completions.parse(
-            model="gpt-4.1-mini-2025-04-14",
-            messages=[
-                {"role": "system", "content": get_reranker_system_prompt()},
-                {"role": "user", "content": llm_payload}
-            ],
-            response_format=Ranked_Documents,
-            temperature=0.1
-        )
-
-        llm_output_str = response.choices[0].message.content
-        if not llm_output_str:
-            logger.warning("OpenAI reranker returned empty content.")
-            return original_docs
-
-        logger.debug("Raw LLM output for reranking: %s", llm_output_str)
-        
-        # Safer JSON parsing
+    for attempt in range(MAX_RETRIES):
         try:
-            llm_response_dict = json.loads(llm_output_str)
-        except json.JSONDecodeError as e:
-            logger.error("Failed to parse reranker output as JSON: %s", e)
-            logger.error("Problematic output: %r", llm_output_str)
-            return original_docs[:RERANKER_TOP_N]
-
-        if not isinstance(llm_response_dict, dict):
-            logger.error("OpenAI reranker did not return a JSON object. Got: %s", type(llm_response_dict))
-            return original_docs[:RERANKER_TOP_N]
-
-        ranked_items = llm_response_dict.get("ranked_documents")
-        if not isinstance(ranked_items, list):
-            logger.error("Reranker did not return a list under 'ranked_documents'. Found: %s", type(ranked_items))
-            return original_docs[:RERANKER_TOP_N]
-
-        final_ranked_docs = []
-        seen_indices = set()
-        for item in ranked_items:
-            if not isinstance(item, dict) or "index" not in item or "source" not in item:
-                logger.warning("Invalid item format from reranker: %r", item)
-                continue
+            response = await client.chat.completions.create(
+                model="gpt-5-nano",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+                timeout=OPENAI_TIMEOUT,
+            )
+            content = response.choices[0].message.content
+            parsed_json = json.loads(content)
             
-            original_index = item.get("index")
-            if isinstance(original_index, int) and 0 <= original_index < len(original_docs) and original_index not in seen_indices:
-                final_ranked_docs.append(original_docs[original_index])
-                seen_indices.add(original_index)
-            else:
-                logger.warning("Reranker referred to an invalid or duplicate index: %r", original_index)
-        
-        logger.info("Reranked %d docs down to %d.", len(original_docs), len(final_ranked_docs))
-        return final_ranked_docs
+            ranked_data = Ranked_Documents.model_validate(parsed_json)
 
-    except Exception as e:
-        logger.error("An error occurred during OpenAI reranking: %s", str(e))
-        # Fallback: prioritize web pages over PDFs
-        web_pages = []
-        pdfs = []
-        for doc in original_docs:
-            source = doc.get("metadata", {}).get("source", "").lower()
-            if ".pdf" in source:
-                pdfs.append(doc)
-            else:
-                web_pages.append(doc)
-        
-        fallback_docs = (web_pages + pdfs)[:RERANKER_TOP_N]
-        logger.info("Reranker failed. Returning prioritized fallback documents.")
-        return fallback_docs
+            # Preserve the order returned by the reranker and guard index bounds
+            ordered_docs: List[Dict[str, Any]] = []
+            for ref in ranked_data.ranked_documents:
+                idx = ref.index
+                if isinstance(idx, int) and 0 <= idx < len(original_docs):
+                    ordered_docs.append(original_docs[idx])
+            return ordered_docs if ordered_docs else original_docs
+
+        except (json.JSONDecodeError, Exception) as e:
+            logger.error(f"Attempt {attempt + 1} failed: {e}")
+            if attempt == MAX_RETRIES - 1:
+                logger.error("Max retries reached. Reranking failed.")
+                return original_docs
+            await asyncio.sleep(RETRY_DELAY)
+    return original_docs
 
 async def rerank_docs(query: str, docs: List[Dict[str, Any]], is_time_sensitive: bool = False) -> List[Dict[str, Any]]:
     """
-    Reranks documents using an OpenAI model.
+    Selects, transforms, and reranks documents using a metadata-aware LLM reranker.
     """
     if not docs:
         return []
 
-    # The is_time_sensitive flag is handled by the reranker's system prompt, not as an argument.
-    reranked_docs = await openai_rerank_and_filter_docs(query, docs)
+    docs_to_rerank = docs[:TOTAL_DOCS_TO_RERANK]
+    logger.info(f"Sending {len(docs_to_rerank)} documents to be reranked.")
 
+    reranked_docs = await openai_rerank_and_filter_docs(query, docs_to_rerank, is_time_sensitive=is_time_sensitive)
     return reranked_docs
 
 async def fetch_balanced_documents(
-    metadata_query: str,
-    natural_language_query: str,
+    rewritten_queries: Dict[str, str],
     pinecone_summary_index: Any, # pinecone.Index
     pinecone_text_index: Any, # pinecone.Index
     embed_model: HuggingFaceEmbeddings,
     bm25_encoder: BM25Encoder,
-    num_summary_docs: int = RETRIEVER_TOP_K,
-    num_text_docs: int = RETRIEVER_TOP_K
+    num_summary_docs: int = RETRIEVAL_K,
+    num_text_docs: int = RETRIEVAL_K
 ) -> List[Document]:
     """
     Retrieves documents from both summary and text indexes in Pinecone using hybrid search,
     combining dense vectors and sparse BM25 vectors for improved retrieval.
     Uses specifically tailored queries for each index.
+    Deduplicates and returns the combined results.
     """
-    async def query_hybrid_retriever(index, query, k):
-        retriever = PineconeHybridSearchRetriever(
-            index=index,
-            embeddings=embed_model,
-            sparse_encoder=bm25_encoder,
-            top_k=k,
-            alpha=HYBRID_ALPHA
-        )
-        try:
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
-                None, 
-                retriever.get_relevant_documents, 
-                query
-            )
-        except Exception as e:
-            logger.error(f"Error during hybrid search on index {index.name} for query '{query}': {e}")
-            return []
-
     try:
-        logger.info(f"Querying summary index with: '{metadata_query}'")
-        logger.info(f"Querying text index with: '{natural_language_query}'")
+        # Extract specialized queries for each index
+        metadata_query = rewritten_queries.get("metadata_query", "")
+        natural_language_query = rewritten_queries.get("natural_language_query", "")
 
+        async def query_hybrid_retriever(index, query, k):
+            try:
+                # Create PineconeHybridSearchRetriever with both dense and sparse encoders
+                hybrid_retriever = PineconeHybridSearchRetriever(
+                    embeddings=embed_model,
+                    sparse_encoder=bm25_encoder,
+                    index=index,
+                    alpha=HYBRID_ALPHA,  # Balance between dense and sparse (0.5 = equal weight)
+                    top_k=k  # Number of results to return
+                )
+
+                # Use the retriever to perform hybrid search
+                logger.info(f"Performing hybrid search with query: {query[:50]}...")
+                results = await asyncio.to_thread(
+                    hybrid_retriever.invoke,
+                    query
+                )
+
+                logger.info(f"Hybrid search retrieved {len(results)} documents")
+                return results
+            except Exception as e:
+                logger.exception(f"Error in hybrid search: {e}")
+                raise
+
+        # Perform hybrid search on both indexes concurrently
         summary_task = query_hybrid_retriever(pinecone_summary_index, metadata_query, num_summary_docs)
         text_task = query_hybrid_retriever(pinecone_text_index, natural_language_query, num_text_docs)
 
@@ -412,25 +356,12 @@ def format_docs_for_llm_prompt(docs: List[Dict[str, Any]]) -> str:
     
     return "\n".join(formatted_docs) 
 
-def initialize_pinecone_clients():
-    """Initializes and returns the Pinecone index clients."""
-    logger.info("Initializing Pinecone clients...")
-    try:
-        pc = Pinecone(api_key=PINECONE_API_KEY)
-        summary_index = pc.Index(PINECONE_SUMMARY_INDEX_NAME)
-        text_index = pc.Index(PINECONE_TEXT_INDEX_NAME)
-        logger.info("Pinecone clients initialized successfully.")
-        return summary_index, text_index
-    except Exception as e:
-        logger.exception("Failed to initialize Pinecone clients.")
-        raise e
-
 def initialize_retrieval_components():
     """Initializes and returns the embedding model and BM25 encoder."""
     logger.info("Initializing retrieval components...")
     try:
         embed_model = HuggingFaceEmbeddings(
-            model_name="Qwen/Qwen3-Embedding-0.6B",
+            model_name=EMBEDDING_MODEL_NAME,
             model_kwargs={"trust_remote_code": True}
         )
         bm25_encoder = BM25Encoder().load(BM25_FILE)
@@ -439,3 +370,6 @@ def initialize_retrieval_components():
     except Exception as e:
         logger.exception("Failed to initialize retrieval components.")
         raise
+
+
+# Tavily fallback removed: prefer explicit user-facing failure messaging in application layer.
