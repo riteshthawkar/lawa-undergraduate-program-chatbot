@@ -184,7 +184,7 @@ async def openai_rerank_and_filter_docs(query: str, original_docs: List[Dict[str
     for attempt in range(MAX_RETRIES):
         try:
             response = await client.chat.completions.create(
-                model="gpt-5-nano",
+                model="gpt-4.1-nano",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}

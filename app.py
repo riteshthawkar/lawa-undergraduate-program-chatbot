@@ -7,14 +7,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from pydantic import ValidationError
-from langchain_huggingface import HuggingFaceEmbeddings
 
 # Import modules
 from modules.config import logger, validate_env_vars, get_system_prompt, RAG_APP_NAME, OPENAI_TIMEOUT
-from modules.schemas import ChatRequest, CitationSource
+from modules.schemas import ChatRequest
 from modules.utils import safe_send, format_query
 from modules.citations import process_citations
 from modules.retrieval import initialize_retrieval_components, rerank_docs, fetch_balanced_documents
@@ -76,14 +74,13 @@ async def lifespan(app: FastAPI):
 # ------------------------------------------------------------------------------
 app = FastAPI(lifespan=lifespan)
 
-# CORS configuration
-cors_env = os.getenv("CORS_ALLOW_ORIGINS", "*")
-allow_origins = [o.strip() for o in cors_env.split(",") if o.strip()] if cors_env != "*" else ["*"]
-allow_credentials = False if allow_origins == ["*"] else True
+# CORS configuration (allow all origins)
+# Note: When allowing all origins, credentials must be disabled by browser rules.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allow_origins,
-    allow_credentials=allow_credentials,
+    allow_origins=["*"],
+    allow_origin_regex=".*",
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -368,6 +365,7 @@ async def websocket_endpoint(websocket: WebSocket):
             updated_answer, citations = await asyncio.to_thread(
                 process_citations, complete_answer, ranked_docs
             )
+            logger.info(f"Citations after processing (WS path): {len(citations)} items")
 
             # Generate a unique string ID for this chat
             chat_str_id = str(uuid.uuid4())
@@ -383,6 +381,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
             # Save chat to DB asynchronously using await
             try:
+                logger.info(f"Saving chat with {len(citations)} citations (WS path)")
                 # Await the async save_chat method
                 chat_id = await ChatRepository.save_chat(app.state.pool, question, updated_answer, citations, chat_str_id, RAG_APP_NAME)
                 if chat_id:
@@ -553,15 +552,35 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
         updated_answer, citations = await asyncio.to_thread(
             process_citations, complete_answer, ranked_docs
         )
+        logger.info(f"Citations after processing (HTTP path): {len(citations)} items")
     else:
         # Handle case where no response was generated (e.g., fallback search failed)
         updated_answer, citations = complete_answer, []
+
+    # Fallback extraction if citations empty but links present (HTTP path)
+    if not citations:
+        try:
+            matches = re.findall(r"\[(\d+)\]\(([^)]+)\)", updated_answer)
+            if matches:
+                seen = set()
+                extracted = []
+                for num, url in matches:
+                    key = (num, url)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    extracted.append({"url": url, "cite_num": str(num)})
+                citations = sorted(extracted, key=lambda x: int(x["cite_num"]))
+                logger.info(f"Extracted {len(citations)} citations from updated answer as fallback (HTTP path).")
+        except Exception as _e:
+            logger.warning(f"Citation fallback extraction failed (HTTP path): {_e}")
 
     # Generate a unique string ID for this chat
     chat_str_id = str(uuid.uuid4())
     
     # Save chat asynchronously without blocking response
     try:
+        logger.info(f"Saving chat with {len(citations)} citations (HTTP path)")
         asyncio.create_task(
             ChatRepository.save_chat(app.state.pool, question, updated_answer, citations, chat_str_id, RAG_APP_NAME)
         )

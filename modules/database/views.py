@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException, status, Request
 from typing import List, Dict, Any, Optional
 import datetime
 
-from ..config import logger
+from ..config import logger, RAG_APP_NAME
 from .models import ChatHistoryEntry, FeedbackUpdate
 from .repository import ChatRepository
 
@@ -165,8 +165,8 @@ async def save_chat_history(request: Request, query: str, response: str, sources
             logger.error("Database pool not available in request state for /history")
             raise HTTPException(status_code=500, detail="Database connection not available")
         
-        # Use await for the async repository method
-        chat_id = await ChatRepository.save_chat(pool, query, response, sources, custom_id)
+        # Use await for the async repository method; include default app name
+        chat_id = await ChatRepository.save_chat(pool, query, response, sources, custom_id, RAG_APP_NAME)
         if chat_id is None and custom_id is None:
              raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

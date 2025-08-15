@@ -50,11 +50,10 @@ class ChatRepository:
 
                     # Insert chat history entry
                     chat_record = await conn.fetchrow(sql_query, *params)
-                    
                     if not chat_record:
                         raise Exception("Failed to insert chat record or retrieve ID.")
-                        
-                        chat_id = chat_record["id"]
+                    # Retrieve generated chat ID
+                    chat_id = chat_record["id"]
                     
                     # Insert sources if any
                     if sources:
