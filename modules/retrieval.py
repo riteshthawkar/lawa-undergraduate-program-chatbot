@@ -42,11 +42,12 @@ MAX_RETRIES = 3
 RETRY_DELAY = 1  # seconds
 BM25_FILE = BM25_FILE_PATH
 
+
 # --- Reranker System Prompt ---
 def get_reranker_system_prompt(is_time_sensitive: bool = False):
     current_date_str = datetime.now().strftime("%B %d, %Y")
 
-    return (
+    base_prompt = (
         """
     As an AI assistant developed by MBZUAI (Mohamed Bin Zayed University of Artificial Intelligence), your task is to re-rank a list of retrieved documents based on their **strict relevance and reliability** to a user's query related to MBZUAI undergraduate program. The objective is to help the response-generation LLM select only the **most accurate, timely, detailed, and MBZUAI undergraduate program-specific** documents.
 
@@ -56,9 +57,11 @@ def get_reranker_system_prompt(is_time_sensitive: bool = False):
 
     ### 📌 MBZUAI-Specific Re-ranking Rules
 
-    1. **MBZUAI Undergraduate program Scope Limitation**:
-    - ONLY retain and prioritize documents that are **strictly and directly related to MBZUAI undergraduate program** (its policies, faculty, student services, etc.).
-    - Exclude or deprioritize any document that includes irrelevant or out-of-scope content (e.g., non-MBZUAI universities, general AI discussions).
+    1. **Scope and Domain Relevance**:
+    - Focus on documents clearly about MBZUAI.
+    - Prefer undergraduate-program documents when the query concerns undergraduate topics (admissions, curriculum, student life, scholarships).
+    - Do not exclude official MBZUAI pages that directly answer the query (e.g., leadership/office pages) even if not explicitly labeled as undergraduate.
+    - Deprioritize graduate-program (MSc/PhD) documents unless the query explicitly concerns graduate programs. When ambiguous, prefer undergraduate or general-official MBZUAI sources.
 
     2. **Temporal Awareness & Recency**:
     - Give strong preference to documents with **recent dates** (especially for deadlines, admissions, events, and news).
@@ -163,9 +166,16 @@ def get_reranker_system_prompt(is_time_sensitive: bool = False):
     Do **not** summarize or answer the query.
     Do **not** hallucinate document utility — judge based only on what's visible in the input.
 
-    Focus purely on **ranking based on MBZUAI relevance, recency, specificity, and authority**.
+    ### 📌 Query Intent Awareness
+    - Infer the user's intent from the query (e.g., identity/role, policy, deadline, process, contact, facility, event).
+    - For identity/role queries (e.g., "Who is the provost?"), prioritize authoritative leadership/office pages that explicitly name the role holders.
+    - For policy/process/deadline queries, prioritize the most recent official undergraduate pages that directly state the required information.
+
+    Focus purely on **ranking based on MBZUAI relevance, recency, specificity, authority, and inferred intent alignment**.
     """
     )
+
+    return base_prompt
 
 
 
@@ -204,6 +214,7 @@ async def openai_rerank_and_filter_docs(query: str, original_docs: List[Dict[str
                 idx = ref.index
                 if isinstance(idx, int) and 0 <= idx < len(original_docs):
                     ordered_docs.append(original_docs[idx])
+
             return ordered_docs if ordered_docs else original_docs
 
         except (json.JSONDecodeError, Exception) as e:

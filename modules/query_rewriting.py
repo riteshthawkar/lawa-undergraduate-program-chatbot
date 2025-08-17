@@ -7,18 +7,26 @@ from modules.config import logger, OPENAI_TIMEOUT
 # Initialize OpenAI client
 openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+"""Query rewriting: keep general across queries while preserving UG scope in answers.
+
+We no longer hard-code leadership detection here. Retrieval stays broad and neutral.
+Final answer scope is still enforced by the chat system prompt (UG-only content).
+"""
+
 # Updated query agent prompt
-query_agent_prompt = """You are an expert query analyzer for the **MBZUAI Undergraduate Program** information system. Your primary goal is to refine user queries to optimize retrieval from two different vector indexes: a summary index and a text index. Your knowledge and responses are strictly limited to the undergraduate (BSc) programs.
+query_agent_prompt = """You are an expert query analyzer for the **MBZUAI information system**. Your primary goal is to refine user queries to optimize retrieval from two different vector indexes: a summary index and a text index. Keep rewrites neutral unless the query clearly targets the undergraduate (BSc) program.
 
-### ⚠️ CRITICAL INSTRUCTION: Assume all queries are about the Undergraduate Program ⚠️
+### ⚠️ CRITICAL INSTRUCTION: Stay Neutral Unless Explicit ⚠️
 
-Unless a query explicitly mentions a graduate program (MSc, PhD), you **MUST** assume it is about the **undergraduate program**. Do not ask for clarification about the program level. Rewrite the query to include the undergraduate context.
+- Do NOT inject a program level unless it is explicitly requested or obviously implied by the user (e.g., the user clearly asks about the undergraduate program).
+- NEVER add graduate-level (MSc/PhD) terms or context to the rewritten queries.
+- For identity/leadership or general institutional queries (e.g., provost, office pages, governance), keep the rewrite neutral.
 
 You have FOUR possible actions:
 
-1.  **REWRITE**: This is the default action. You must generate **TWO** distinct queries that are focused on the undergraduate program.
-    *   `metadata_query`: A query optimized for a summary index. It **MUST** be a concise collection of keywords and phrases that **ALWAYS** includes "undergraduate" or "BSc".
-    *   `natural_language_query`: A well-formed, natural language question that **MUST** explicitly mention the "undergraduate program" or "BSc program".
+1.  **REWRITE**: This is the default action. You must generate **TWO** distinct queries.
+    *   `metadata_query`: A concise collection of keywords optimized for a summary index. Include program markers like "undergraduate", "bachelor", or "BSc" only if the query clearly concerns the undergraduate program. Otherwise, keep it neutral.
+    *   `natural_language_query`: A well-formed, natural language question that preserves the user's original intent. Only add "undergraduate" or "BSc" if explicitly relevant; otherwise, keep it neutral.
 
 2.  **CLARIFY**: Use this action **ONLY** if the query is explicitly about graduate-level programs (e.g., Master's, MSc, PhD, Doctoral). Your response must state that you only provide information on the undergraduate program.
 
@@ -31,15 +39,15 @@ You have FOUR possible actions:
 ### Query Rewriting Guidelines
 
 **For `metadata_query` (Summary Index):**
-*   **Goal**: Match structured metadata for the undergraduate program.
-*   **Format**: A string of keywords. Must include terms like `undergraduate`, `bachelor`, `BSc`.
+*   **Goal**: Match structured metadata for the user's topic.
+*   **Format**: A string of keywords. Include `undergraduate`, `bachelor`, `BSc` only when clearly relevant; otherwise avoid program-level markers.
 *   **Example**:
     *   User Query: "What are the tuition fees?"
     *   `metadata_query`: "tuition fees cost undergraduate bachelor BSc program"
 
 **For `natural_language_query` (Text Index):**
-*   **Goal**: Match raw text content about the undergraduate program.
-*   **Format**: A full, unambiguous question specifying the undergraduate context.
+*   **Goal**: Match raw text content for the user's topic.
+*   **Format**: A full, unambiguous question that stays neutral unless the query clearly targets the undergraduate program.
 *   **Example**:
     *   User Query: "What about the requirements?"
     *   `natural_language_query`: "What are the admission requirements for the undergraduate program at MBZUAI?"
