@@ -53,8 +53,8 @@ async def lifespan(app: FastAPI):
     pinecone_api_key = os.getenv("PINECONE_API_KEY")
     pc = Pinecone(api_key=pinecone_api_key)
     
-    summary_index_name = os.getenv("PINECONE_SUMMARY_INDEX_NAME", "mbzuai-summary-only-index-latest")
-    text_index_name = os.getenv("PINECONE_TEXT_INDEX_NAME", "mbzuai-text-only-index-latest")
+    summary_index_name = os.getenv("PINECONE_SUMMARY_INDEX_NAME", "mbzuai-undergraduate-summary-only-index")
+    text_index_name = os.getenv("PINECONE_TEXT_INDEX_NAME", "mbzuai-undergraduate-text-only-index")
 
     logger.info(f"Connecting to Pinecone indexes: '{summary_index_name}' and '{text_index_name}'...")
     app.state.pinecone_summary_index = pc.Index(summary_index_name)
