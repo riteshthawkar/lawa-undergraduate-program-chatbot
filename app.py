@@ -315,7 +315,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 async for chunk in completion:
                     delta_content = chunk.choices[0].delta.content
                     if delta_content:
-                        if "🛑" in delta_content:
+                        # Only stop on specific patterns that clearly indicate the LLM wants to stop
+                        # Check for the exact phrases from the system prompt that should trigger stopping
+                        if ("🛑" in delta_content and 
+                            ("out of my scope" in delta_content.lower() or 
+                             "out of scope" in delta_content.lower() or
+                             "not contain relevant information" in delta_content.lower())):
+                            logger.info(f"Stopping response generation due to scope violation pattern: {delta_content}")
                             isResponseAvailable = False
                             break
                         complete_answer += delta_content
@@ -526,7 +532,13 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
         async for chunk in completion:
             delta_content = chunk.choices[0].delta.content
             if delta_content:
-                if "🛑" in delta_content:
+                # Only stop on specific patterns that clearly indicate the LLM wants to stop
+                # Check for the exact phrases from the system prompt that should trigger stopping
+                if ("🛑" in delta_content and 
+                    ("out of my scope" in delta_content.lower() or 
+                     "out of scope" in delta_content.lower() or
+                     "not contain relevant information" in delta_content.lower())):
+                    logger.info(f"Stopping response generation due to scope violation pattern: {delta_content}")
                     isResponseAvailable = False
                     break
                 complete_answer += delta_content
