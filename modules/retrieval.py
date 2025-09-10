@@ -82,6 +82,13 @@ def get_reranker_system_prompt(is_time_sensitive: bool = False):
     5. **Official and Authoritative Sources**:
     - Consider whether the document appears to be an **official MBZUAI undergraduate program page**, report, or publication.
     - Prioritize such official sources over less authoritative ones (e.g., newsletters or promotional blurbs).
+    
+    5a. **GitBook Source Priority (CRITICAL)**:
+    - GitBook sources (mbzuai.gitbook.io) are OFFICIAL student handbooks and have ABSOLUTE HIGHEST PRIORITY
+    - ALWAYS include GitBook sources in the top 3 positions when they exist in the document list
+    - Even if GitBook content seems less detailed, prioritize it over ALL other sources
+    - GitBook sources should NEVER be excluded from the final ranked list
+    - If multiple GitBook sources exist, rank them by relevance but keep them all in top positions
 
     6. **Avoiding Weak or Ambiguous Mentions**:
     - Do not include documents that only vaguely mention the topic or contain keyword matches without substance.

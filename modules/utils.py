@@ -27,9 +27,19 @@ def format_docs(docs: List) -> str:
         else:
             source = 'N/A'
         
+        # Check if this is a GitBook source for special formatting
+        is_gitbook = 'mbzuai.gitbook.io' in source
+        
         context += f"\n{'=' * 75}\n"
         context += f"**DOCUMENT CITATION INDEX:** {index + 1}\n"
-        context += f"**DOCUMENT SOURCE:** {source}\n\n"
+        context += f"**DOCUMENT SOURCE:** {source}\n"
+        
+        # Add special GitBook priority marker
+        if is_gitbook:
+            context += f"🔥 **GITBOOK OFFICIAL SOURCE - ABSOLUTE HIGHEST PRIORITY - MUST BE CITED** 🔥\n"
+            context += f"📚 **OFFICIAL STUDENT HANDBOOK - PRIMARY SOURCE FOR ALL INFORMATION** 📚\n"
+        
+        context += "\n"
         
         # Get content from page_content for Document objects or context field for dict-like objects
         content = ""
@@ -51,4 +61,12 @@ def format_docs(docs: List) -> str:
 def format_query(query: str, language: str, docs: List[dict]) -> str:
     """Format the query with language and document context"""
     formatted_docs = format_docs(docs)
-    return f"**USER QUERY:** {query}\n**LANGUAGE:** {language}\n**CONTEXT:**\n{formatted_docs}" 
+    
+    # Check if any GitBook documents are present
+    has_gitbook = any('mbzuai.gitbook.io' in str(doc.metadata.get('page_source', '')) for doc in docs)
+    
+    gitbook_instruction = ""
+    if has_gitbook:
+        gitbook_instruction = "\n🔥 **CRITICAL: GITBOOK SOURCES DETECTED - YOU MUST CITE THEM** 🔥\n"
+    
+    return f"**USER QUERY:** {query}\n**LANGUAGE:** {language}{gitbook_instruction}\n**CONTEXT:**\n{formatted_docs}" 

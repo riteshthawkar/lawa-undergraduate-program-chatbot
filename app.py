@@ -432,8 +432,8 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
     # Apply query rewriting agent to analyze and possibly rewrite the query
     agent_result = await query_rewriting_agent(question=question, language=language, message_history=previous_chats)
     
-    # Handle direct responses (out of scope or clarification requests)
-    if agent_result["action"] in ["respond", "clarify"]:
+    # Handle direct responses (out of scope, clarification requests, or ambiguous queries)
+    if agent_result["action"] in ["respond", "clarify", "ask_clarification"]:
         return {
             "response": agent_result["response"],
             "sources": []

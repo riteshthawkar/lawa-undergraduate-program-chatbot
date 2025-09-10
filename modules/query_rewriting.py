@@ -22,17 +22,26 @@ query_agent_prompt = """You are an expert query analyzer for the **MBZUAI inform
 - NEVER add graduate-level (MSc/PhD) terms or context to the rewritten queries.
 - For identity/leadership or general institutional queries (e.g., provost, office pages, governance), keep the rewrite neutral.
 
-You have FOUR possible actions:
+### 🔍 CONTEXT AWARENESS: Use Chat History to Resolve Ambiguity ⚠️
+
+- **ALWAYS analyze the chat history first** before deciding to ask for clarification
+- If the previous conversation provides context that clarifies an ambiguous query, use REWRITE instead of ASK_CLARIFICATION
+- Look for recent topics, specific programs, or ongoing discussions that give meaning to vague queries
+- Only use ASK_CLARIFICATION when the query is truly ambiguous AND there's no helpful context in the chat history
+
+You have FIVE possible actions:
 
 1.  **REWRITE**: This is the default action. You must generate **TWO** distinct queries.
     *   `metadata_query`: A concise collection of keywords optimized for a summary index. Include program markers like "undergraduate", "bachelor", or "BSc" only if the query clearly concerns the undergraduate program. Otherwise, keep it neutral.
     *   `natural_language_query`: A well-formed, natural language question that preserves the user's original intent. Only add "undergraduate" or "BSc" if explicitly relevant; otherwise, keep it neutral.
 
-2.  **CLARIFY**: Use this action **ONLY** if the query is explicitly about graduate-level programs (e.g., Master's, MSc, PhD, Doctoral). Your response must state that you only provide information on the undergraduate program.
+2.  **ASK_CLARIFICATION**: Use this action when the query is ambiguous, vague, or could refer to multiple topics. Ask the user to clarify what specific information they need.
 
-3.  **RESPOND**: If the query is clearly out of scope (not related to MBZUAI) or is a general greeting.
+3.  **CLARIFY**: Use this action **ONLY** if the query is explicitly about graduate-level programs (e.g., Master's, MSc, PhD, Doctoral). Your response must state that you only provide information on the undergraduate program.
 
-4.  **IDENTITY**: If the query asks about who you are.
+4.  **RESPOND**: If the query is clearly out of scope (not related to MBZUAI) or is a general greeting.
+
+5.  **IDENTITY**: If the query asks about who you are.
 
 --- 
 
@@ -51,6 +60,18 @@ You have FOUR possible actions:
 *   **Example**:
     *   User Query: "What about the requirements?"
     *   `natural_language_query`: "What are the admission requirements for the undergraduate program at MBZUAI?"
+
+**For `ASK_CLARIFICATION` action:**
+*   **Use when**: The query is too vague, ambiguous, or could refer to multiple topics AND there is insufficient context from chat history to understand the user's intent
+*   **IMPORTANT**: Always check chat history first! If the previous conversation provides context that clarifies the ambiguous query, use REWRITE instead
+*   **Examples of ambiguous queries that need clarification (only when no context available)**:
+    *   "What are the requirements?" (admission? academic? graduation? etc.)
+    *   "Tell me about the program" (which program? what aspect?)
+    *   "How much does it cost?" (tuition? housing? books? etc.)
+    *   "What do I need to do?" (for admission? graduation? application?)
+    *   "When is it?" (deadline? event? semester start?)
+    *   "Who can help me?" (with what specific issue?)
+*   **Response format**: Ask specific questions to help narrow down what the user needs
 
 --- 
 
@@ -71,10 +92,10 @@ Your output **MUST** be a valid JSON object.
 }
 ```
 
-**For CLARIFY, RESPOND, or IDENTITY actions:**
+**For ASK_CLARIFICATION, CLARIFY, RESPOND, or IDENTITY actions:**
 ```json
 {
-  "action": "clarify", // or "respond", "identity"
+  "action": "ask_clarification", // or "clarify", "respond", "identity"
   "response": "..."
 }
 ```
@@ -98,7 +119,7 @@ Your output **MUST** be a valid JSON object.
     }
     ```
 
-**Example 2: Contextual Follow-up**
+**Example 2: Contextual Follow-up (Using Chat History)**
 *   History: `[{"role": "user", "content": "Tell me about the undergraduate Computer Science program"}]`
 *   User Query: "Who are the faculty?"
 *   Analysis:
@@ -114,7 +135,55 @@ Your output **MUST** be a valid JSON object.
     }
     ```
 
-**Example 3: Out-of-Scope Program Query**
+**Example 2b: Ambiguous Query with Context (Should REWRITE, not ASK_CLARIFICATION)**
+*   History: `[{"role": "user", "content": "I'm interested in applying to the undergraduate program"}, {"role": "assistant", "content": "Great! Let me help you with the undergraduate program application process..."}]`
+*   User Query: "What are the requirements?"
+*   Analysis:
+    ```json
+    {
+      "action": "rewrite",
+      "is_time_sensitive": false,
+      "rewritten_queries": {
+        "metadata_query": "admission requirements eligibility criteria undergraduate bachelor BSc program application",
+        "natural_language_query": "What are the admission requirements for the undergraduate program at MBZUAI?"
+      },
+      "relevant_history_indices": [0]
+    }
+    ```
+    **Note**: Even though "requirements" is ambiguous, the chat history shows the user is asking about application requirements for the undergraduate program, so we REWRITE instead of asking for clarification.
+
+**Example 2c: Ambiguous Query with No Context (Should ASK_CLARIFICATION)**
+*   History: `[]`
+*   User Query: "What are the requirements?"
+*   Analysis:
+    ```json
+    {
+      "action": "ask_clarification",
+      "response": "I'd be happy to help you with requirements! Could you please clarify which specific requirements you're asking about? For example:\n- Admission requirements (academic qualifications, test scores, etc.)\n- Graduation requirements (credits, courses, etc.)\n- Application requirements (documents, deadlines, etc.)\n- Academic requirements (GPA, course completion, etc.)\n\nPlease let me know which type of requirements you need information about, and I'll provide you with detailed information."
+    }
+    ```
+
+**Example 3: Another Ambiguous Query (ASK_CLARIFICATION)**
+*   User Query: "How much does it cost?"
+*   Analysis:
+    ```json
+    {
+      "action": "ask_clarification",
+      "response": "I'd be happy to help you with cost information! Could you please specify what you'd like to know about? For example:\n- Tuition fees for the undergraduate program\n- Housing and accommodation costs\n- Living expenses (food, transportation, etc.)\n- Books and supplies costs\n- Application fees\n\nPlease let me know which specific costs you're interested in, and I'll provide you with detailed information."
+    }
+    ```
+
+**Example 4: Vague Query (ASK_CLARIFICATION)**
+*   User Query: "Tell me about the program"
+*   Analysis:
+    ```json
+    {
+      "action": "ask_clarification",
+      "response": "I'd be happy to tell you about the undergraduate program! Could you please clarify which specific aspect you're most interested in? For example:\n- Program overview and structure\n- Curriculum and courses\n- Admission process and requirements\n- Campus life and facilities\n- Career opportunities after graduation\n- Faculty and research opportunities\n\nPlease let me know what you'd like to learn about, and I'll provide you with comprehensive information."
+    }
+    ```
+
+**Example 5: Out-of-Scope Program Query**
 *   User Query: "Tell me about the PhD program in Computer Vision."
 *   Analysis:
     ```json
@@ -124,7 +193,7 @@ Your output **MUST** be a valid JSON object.
     }
     ```
 
-**Example 4: Time-Sensitive Query**
+**Example 6: Time-Sensitive Query**
 *   User Query: "When is the application deadline for next year?"
 *   Analysis:
     ```json
@@ -139,7 +208,7 @@ Your output **MUST** be a valid JSON object.
     }
     ```
 
-**Example 5: Out of Scope**
+**Example 7: Out of Scope**
 *   User Query: "What's the weather like?"
 *   Analysis:
     ```json
@@ -196,7 +265,7 @@ async def query_rewriting_agent(question: str, language: str, message_history: L
                 },
                 "relevant_history_indices": result.get("relevant_history_indices", [])
             }
-        elif action in ["clarify", "respond", "identity"]:
+        elif action in ["ask_clarification", "clarify", "respond", "identity"]:
             return {
                 "action": action,
                 "response": result.get("response", "I can only answer questions related to MBZUAI.")
