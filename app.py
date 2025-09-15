@@ -163,8 +163,8 @@ async def websocket_endpoint(websocket: WebSocket):
             # Apply query rewriting agent to analyze and possibly rewrite the query
             agent_result = await query_rewriting_agent(question, language, previous_chats)
             
-            # Handle direct responses (out of scope, clarification requests, or identity questions)
-            if agent_result["action"] in ["respond", "clarify", "identity"]:
+            # Handle direct responses (out of scope or identity questions)
+            if agent_result["action"] in ["respond", "identity"]:
                 # Generate a unique string ID for this chat
                 chat_str_id = str(uuid.uuid4())
                 
@@ -247,8 +247,46 @@ async def websocket_endpoint(websocket: WebSocket):
                 )
                 if not docs:
                     logger.warning("No documents found in Pinecone.")
-                    await safe_send(websocket, {"status": "not_found", "message": "I couldn’t find enough MBZUAI-specific information to answer that. Try rephrasing with more details (for example: program name, semester, or deadline)."})
-                    return
+                    # Use main response generation agent to provide intelligent clarification
+                    await safe_send(websocket, {"status": "no_docs", "message": "No relevant documents found. Generating clarification response..."})
+                    
+                    # Prepare messages for clarification response
+                    messages = [{"role": "system", "content": get_system_prompt()}]
+                    messages.extend(relevant_history)
+                    messages.append({"role": "user", "content": f"Query: {question}\nLanguage: {language}\n\nI searched our MBZUAI knowledge base but couldn't find relevant documents to answer this question. Please provide an intelligent clarification response that explains what I searched for and asks for specific details to help the user refine their question."})
+                    
+                    try:
+                        completion = await openai_client.chat.completions.create(
+                            model="chatgpt-4o-latest",
+                            messages=messages,
+                            temperature=0,
+                            max_tokens=512,
+                            timeout=OPENAI_TIMEOUT,
+                        )
+                        clarification_response = completion.choices[0].message.content
+                        
+                        # Generate a unique string ID for this chat
+                        chat_str_id = str(uuid.uuid4())
+                        
+                        # Send the clarification response
+                        await safe_send(websocket, {
+                            "response": clarification_response,
+                            "sources": [],
+                            "id": chat_str_id
+                        })
+                        
+                        # Save the clarification response to the database
+                        try:
+                            chat_id = await ChatRepository.save_chat(app.state.pool, question, clarification_response, [], chat_str_id, RAG_APP_NAME)
+                            logger.info(f"Clarification response saved to database with numeric ID: {chat_id}, string ID: {chat_str_id}")
+                        except Exception as e:
+                            logger.exception(f"Failed to save clarification response to database: {e}")
+                        
+                        return
+                    except Exception as e:
+                        logger.exception("Error generating clarification response:")
+                        await safe_send(websocket, {"status": "error", "message": "I couldn't find relevant information and had trouble generating a clarification response. Please try rephrasing your question with more specific details."})
+                        return
 
             except Exception as e:
                 logger.exception("Failed to fetch documents from Pinecone.")
@@ -438,8 +476,8 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
     # Apply query rewriting agent to analyze and possibly rewrite the query
     agent_result = await query_rewriting_agent(question=question, language=language, message_history=previous_chats)
     
-    # Handle direct responses (out of scope, clarification requests, or ambiguous queries)
-    if agent_result["action"] in ["respond", "clarify", "ask_clarification"]:
+    # Handle direct responses (out of scope queries)
+    if agent_result["action"] in ["respond"]:
         return {
             "response": agent_result["response"],
             "sources": []
@@ -481,10 +519,37 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
         )
         if not docs:
             logger.warning("No documents found in Pinecone for the query.")
-            return JSONResponse(
-                status_code=404,
-                content={"response": "Sorry, I couldn't find any relevant information to answer your question.", "sources": [], "id": str(uuid.uuid4())}
-            )
+            # Use main response generation agent to provide intelligent clarification
+            try:
+                # Prepare messages for clarification response
+                messages = [{"role": "system", "content": get_system_prompt()}]
+                messages.extend(relevant_history)
+                messages.append({"role": "user", "content": f"Query: {question}\nLanguage: {language}\n\nI searched our MBZUAI knowledge base but couldn't find relevant documents to answer this question. Please provide an intelligent clarification response that explains what I searched for and asks for specific details to help the user refine their question."})
+                
+                completion = await openai_client.chat.completions.create(
+                    model="chatgpt-4o-latest",
+                    messages=messages,
+                    temperature=0,
+                    max_tokens=512,
+                    timeout=OPENAI_TIMEOUT,
+                )
+                clarification_response = completion.choices[0].message.content
+                
+                # Generate a unique string ID for this chat
+                chat_str_id = str(uuid.uuid4())
+                
+                # Save the clarification response to the database
+                try:
+                    asyncio.create_task(
+                        ChatRepository.save_chat(app.state.pool, question, clarification_response, [], chat_str_id, RAG_APP_NAME)
+                    )
+                except Exception as e:
+                    logger.exception(f"Failed to schedule clarification response save: {e}")
+                
+                return {"response": clarification_response, "sources": [], "id": chat_str_id}
+            except Exception as e:
+                logger.exception("Error generating clarification response:")
+                return {"response": "I couldn't find relevant information and had trouble generating a clarification response. Please try rephrasing your question with more specific details.", "sources": [], "id": str(uuid.uuid4())}
     except Exception as e:
         logger.exception("Failed to fetch documents from Pinecone.")
         return JSONResponse(

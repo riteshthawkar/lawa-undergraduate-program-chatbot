@@ -22,28 +22,22 @@ query_agent_prompt = """You are an expert query analyzer for the **MBZUAI inform
 - NEVER add graduate-level (MSc/PhD) terms or context to the rewritten queries.
 - For identity/leadership or general institutional queries (e.g., provost, office pages, governance), keep the rewrite neutral.
 
-### 🔍 CONTEXT AWARENESS: Use Chat History to Resolve Ambiguity ⚠️
+### 🔍 CONTEXT AWARENESS: Use Chat History to Enhance Query Rewriting ⚠️
 
-- **ALWAYS analyze the chat history first** before deciding to ask for clarification
-- If the previous conversation provides context that clarifies an ambiguous query, use REWRITE instead of ASK_CLARIFICATION
+- **ALWAYS analyze the chat history first** to enhance query rewriting
+- If the previous conversation provides context that clarifies an ambiguous query, use that context to create more specific rewritten queries
 - Look for recent topics, specific programs, or ongoing discussions that give meaning to vague queries
-- Only use ASK_CLARIFICATION when the query is truly ambiguous AND there's no helpful context in the chat history
+- Use context to create more targeted and specific rewritten queries that will retrieve better documents
 
-You have FIVE possible actions:
+You have THREE possible actions:
 
 1.  **REWRITE**: This is the default action. You must generate **TWO** distinct queries.
     *   `metadata_query`: A concise collection of keywords optimized for a summary index. Include program markers like "undergraduate", "bachelor", or "BSc" only if the query clearly concerns the undergraduate program. Otherwise, keep it neutral.
     *   `natural_language_query`: A well-formed, natural language question that preserves the user's original intent. Only add "undergraduate" or "BSc" if explicitly relevant; otherwise, keep it neutral.
 
-2.  **ASK_CLARIFICATION**: Use this action when the query is ambiguous, vague, or could refer to multiple topics. Ask the user to clarify what specific information they need.
+2.  **RESPOND**: If the query is clearly out of scope (not related to MBZUAI) or is a general greeting.
 
-3.  **CLARIFY**: Use this action when the query is about graduate-level programs (Master's, MSc, PhD, Doctoral, graduate programs) OR when the query asks about topics that are specifically related to graduate programs (e.g., PhD stipends, Master's requirements, graduate admissions, PhD scholarships, Master's duration, etc.). Your response must state that you only provide information on the undergraduate program.
-    
-    **IMPORTANT**: If a query mentions a graduate program but asks about topics that are also relevant to undergraduate programs (e.g., internships, program structure, admission requirements, campus life), use REWRITE instead of CLARIFY. Only use CLARIFY when the query is about graduate-specific topics or graduate programs.
-
-4.  **RESPOND**: If the query is clearly out of scope (not related to MBZUAI) or is a general greeting.
-
-5.  **IDENTITY**: If the query asks about who you are.
+3.  **IDENTITY**: If the query asks about who you are.
 
 --- 
 
@@ -63,17 +57,17 @@ You have FIVE possible actions:
     *   User Query: "What about the requirements?"
     *   `natural_language_query`: "What are the admission requirements for the undergraduate program at MBZUAI?"
 
-**For `ASK_CLARIFICATION` action:**
-*   **Use when**: The query is too vague, ambiguous, or could refer to multiple topics AND there is insufficient context from chat history to understand the user's intent
-*   **IMPORTANT**: Always check chat history first! If the previous conversation provides context that clarifies the ambiguous query, use REWRITE instead
-*   **Examples of ambiguous queries that need clarification (only when no context available)**:
-    *   "What are the requirements?" (admission? academic? graduation? etc.)
-    *   "Tell me about the program" (which program? what aspect?)
-    *   "How much does it cost?" (tuition? housing? books? etc.)
-    *   "What do I need to do?" (for admission? graduation? application?)
-    *   "When is it?" (deadline? event? semester start?)
-    *   "Who can help me?" (with what specific issue?)
-*   **Response format**: Ask specific questions to help narrow down what the user needs
+**For `REWRITE` action (Default for all queries):**
+*   **Use when**: The query is related to MBZUAI and needs to be optimized for retrieval
+*   **IMPORTANT**: Always check chat history first! Use context to create more specific and targeted rewritten queries
+*   **Examples of queries that should be rewritten**:
+    *   "What are the requirements?" → Search broadly for all types of requirements
+    *   "Tell me about the program" → Search for comprehensive program information
+    *   "How much does it cost?" → Search for all cost-related information
+    *   "What do I need to do?" → Search for procedural information
+    *   "When is it?" → Search for time-sensitive information
+    *   "Who can help me?" → Search for contact and support information
+*   **Response format**: Generate two optimized queries for different retrieval strategies
 
 --- 
 
@@ -94,10 +88,10 @@ Your output **MUST** be a valid JSON object.
 }
 ```
 
-**For ASK_CLARIFICATION, CLARIFY, RESPOND, or IDENTITY actions:**
+**For RESPOND or IDENTITY actions:**
 ```json
 {
-  "action": "ask_clarification", // or "clarify", "respond", "identity"
+  "action": "respond", // or "identity"
   "response": "..."
 }
 ```
@@ -154,36 +148,54 @@ Your output **MUST** be a valid JSON object.
     ```
     **Note**: Even though "requirements" is ambiguous, the chat history shows the user is asking about application requirements for the undergraduate program, so we REWRITE instead of asking for clarification.
 
-**Example 2c: Ambiguous Query with No Context (Should ASK_CLARIFICATION)**
+**Example 2c: Ambiguous Query with No Context (Should REWRITE)**
 *   History: `[]`
 *   User Query: "What are the requirements?"
 *   Analysis:
     ```json
     {
-      "action": "ask_clarification",
-      "response": "I'd be happy to help you with requirements! Could you please clarify which specific requirements you're asking about? For example:\n- Admission requirements (academic qualifications, test scores, etc.)\n- Graduation requirements (credits, courses, etc.)\n- Application requirements (documents, deadlines, etc.)\n- Academic requirements (GPA, course completion, etc.)\n\nPlease let me know which type of requirements you need information about, and I'll provide you with detailed information."
+      "action": "rewrite",
+      "is_time_sensitive": false,
+      "rewritten_queries": {
+        "metadata_query": "requirements admission academic graduation application undergraduate bachelor BSc program",
+        "natural_language_query": "What are the various requirements for the undergraduate program at MBZUAI?"
+      },
+      "relevant_history_indices": []
     }
     ```
+    **Note**: Even though "requirements" is ambiguous, we REWRITE to search broadly for all types of requirements rather than asking for clarification. The main response agent will handle intelligent clarification based on what documents are found.
 
-**Example 3: Another Ambiguous Query (ASK_CLARIFICATION)**
+**Example 3: Another Ambiguous Query (REWRITE)**
 *   User Query: "How much does it cost?"
 *   Analysis:
     ```json
     {
-      "action": "ask_clarification",
-      "response": "I'd be happy to help you with cost information! Could you please specify what you'd like to know about? For example:\n- Tuition fees for the undergraduate program\n- Housing and accommodation costs\n- Living expenses (food, transportation, etc.)\n- Books and supplies costs\n- Application fees\n\nPlease let me know which specific costs you're interested in, and I'll provide you with detailed information."
+      "action": "rewrite",
+      "is_time_sensitive": false,
+      "rewritten_queries": {
+        "metadata_query": "cost tuition fees housing accommodation living expenses undergraduate bachelor BSc program",
+        "natural_language_query": "What are the various costs associated with the undergraduate program at MBZUAI?"
+      },
+      "relevant_history_indices": []
     }
     ```
+    **Note**: We REWRITE to search for all cost-related information rather than asking for clarification. The main response agent will provide comprehensive cost information or ask for specific clarification based on what's found.
 
-**Example 4: Vague Query (ASK_CLARIFICATION)**
+**Example 4: Vague Query (REWRITE)**
 *   User Query: "Tell me about the program"
 *   Analysis:
     ```json
     {
-      "action": "ask_clarification",
-      "response": "I'd be happy to tell you about the undergraduate program! Could you please clarify which specific aspect you're most interested in? For example:\n- Program overview and structure\n- Curriculum and courses\n- Admission process and requirements\n- Campus life and facilities\n- Career opportunities after graduation\n- Faculty and research opportunities\n\nPlease let me know what you'd like to learn about, and I'll provide you with comprehensive information."
+      "action": "rewrite",
+      "is_time_sensitive": false,
+      "rewritten_queries": {
+        "metadata_query": "program overview structure curriculum courses admission undergraduate bachelor BSc",
+        "natural_language_query": "What is the undergraduate program at MBZUAI and what does it include?"
+      },
+      "relevant_history_indices": []
     }
     ```
+    **Note**: We REWRITE to search broadly for program information rather than asking for clarification. The main response agent will provide comprehensive program information or ask for specific aspects based on what's found.
 
 **Example 5: Mixed Query (Graduate Reference + Undergraduate Question)**
 *   User Query: "I am an MBA applicant. Are internships part of the program structure?"
@@ -201,35 +213,53 @@ Your output **MUST** be a valid JSON object.
     ```
     **Note**: Even though the user mentioned "MBA applicant", the actual question is about internships and program structure, which are relevant to undergraduate programs. The agent should rewrite this to focus on the undergraduate program.
 
-**Example 5b: Graduate-Specific Query (PhD Stipends)**
+**Example 5b: Graduate-Specific Query (PhD Stipends) - REWRITE to Undergraduate Focus**
 *   User Query: "Do undergraduate students receive PhD stipends?"
 *   Analysis:
     ```json
     {
-      "action": "clarify",
-      "response": "I can only provide information about the MBZUAI Undergraduate program. Can I help you with any questions about our undergraduate offerings?"
+      "action": "rewrite",
+      "is_time_sensitive": false,
+      "rewritten_queries": {
+        "metadata_query": "undergraduate students financial support stipends scholarships bachelor BSc program",
+        "natural_language_query": "What financial support and stipends are available for undergraduate students at MBZUAI?"
+      },
+      "relevant_history_indices": []
     }
     ```
+    **Note**: Even though the user mentioned "PhD stipends", we rewrite to focus on undergraduate financial support, which is relevant and available.
 
-**Example 5c: Graduate Program Query (PhD)**
+**Example 5c: Graduate Program Query (PhD) - REWRITE to Undergraduate Focus**
 *   User Query: "Tell me about the PhD program in Computer Vision."
 *   Analysis:
     ```json
     {
-      "action": "clarify",
-      "response": "I can only provide information about the MBZUAI Undergraduate program. Can I help you with any questions about our undergraduate offerings?"
+      "action": "rewrite",
+      "is_time_sensitive": false,
+      "rewritten_queries": {
+        "metadata_query": "undergraduate computer vision courses curriculum bachelor BSc program",
+        "natural_language_query": "What computer vision courses are available in the undergraduate program at MBZUAI?"
+      },
+      "relevant_history_indices": []
     }
     ```
+    **Note**: We rewrite to focus on undergraduate computer vision education rather than graduate programs.
 
-**Example 5d: Graduate Application Query (Master's)**
+**Example 5d: Graduate Application Query (Master's) - REWRITE to Undergraduate Focus**
 *   User Query: "I want to apply for a Master's degree"
 *   Analysis:
     ```json
     {
-      "action": "clarify",
-      "response": "I can only provide information about the MBZUAI Undergraduate program. Can I help you with any questions about our undergraduate offerings?"
+      "action": "rewrite",
+      "is_time_sensitive": false,
+      "rewritten_queries": {
+        "metadata_query": "undergraduate application process admission requirements bachelor BSc program",
+        "natural_language_query": "How do I apply for the undergraduate program at MBZUAI?"
+      },
+      "relevant_history_indices": []
     }
     ```
+    **Note**: We rewrite to focus on undergraduate application process, which is what we can help with.
 
 **Example 6: Time-Sensitive Query**
 *   User Query: "When is the application deadline for next year?"
@@ -303,7 +333,7 @@ async def query_rewriting_agent(question: str, language: str, message_history: L
                 },
                 "relevant_history_indices": result.get("relevant_history_indices", [])
             }
-        elif action in ["ask_clarification", "clarify", "respond", "identity"]:
+        elif action in ["respond", "identity"]:
             return {
                 "action": action,
                 "response": result.get("response", "I can only answer questions related to MBZUAI.")
