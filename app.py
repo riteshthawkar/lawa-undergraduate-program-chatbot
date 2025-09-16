@@ -190,34 +190,15 @@ async def websocket_endpoint(websocket: WebSocket):
             natural_language_query = agent_result.get("natural_language_query", question)
             logger.info(f"Using Metadata Query: '{metadata_query}' and Natural Language Query: '{natural_language_query}'")
 
-            # Filter previous chat messages based on relevance
+            # Use last 5 message-response pairs for context (simple and reliable)
             relevant_history = []
-            if "relevant_history_indices" in agent_result and previous_chats:
-                indices = agent_result["relevant_history_indices"]
-                
-                # Create a set to track which indices to include (including assistants' responses)
-                indices_to_include = set()
-                
-                # Include each relevant message index
-                for idx in indices:
-                    if 0 <= idx < len(previous_chats):
-                        indices_to_include.add(idx)
-                        # If this is a user message and there's an assistant response right after,
-                        # include the assistant's response too
-                        if idx + 1 < len(previous_chats) and previous_chats[idx]["role"] == "user" and previous_chats[idx + 1]["role"] == "assistant":
-                            indices_to_include.add(idx + 1)
-                
-                # Sort the indices to maintain conversation order
-                sorted_indices = sorted(indices_to_include)
-                
-                # Get relevant messages in order
-                relevant_history = [previous_chats[i] for i in sorted_indices]
-                
-                # Log the filtering of message history
-                if len(relevant_history) < len(previous_chats):
-                    logger.info(f"Filtered message history from {len(previous_chats)} to {len(relevant_history)} relevant messages")
+            if previous_chats:
+                # Take the last 10 messages (5 pairs) or all if fewer
+                max_messages = min(10, len(previous_chats))
+                relevant_history = previous_chats[-max_messages:]
+                logger.info(f"Using last {len(relevant_history)} messages for context (out of {len(previous_chats)} total)")
             else:
-                # If no relevance info or no previous chats, use empty history
+                # If no previous chats, use empty history
                 relevant_history = []
             
             await safe_send(websocket, {"status": "rewriting", "message": "Analyzing and optimizing your question for best results..."})
@@ -488,21 +469,15 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
     natural_language_query = agent_result.get("natural_language_query", question)
     logger.info(f"Using Metadata Query: '{metadata_query}' and Natural Language Query: '{natural_language_query}'")
 
-    # Filter previous chat messages based on relevance
+    # Use last 5 message-response pairs for context (simple and reliable)
     relevant_history = []
-    if "relevant_history_indices" in agent_result and previous_chats:
-        indices = agent_result["relevant_history_indices"]
-        indices_to_include = set()
-        for idx in indices:
-            if 0 <= idx < len(previous_chats):
-                indices_to_include.add(idx)
-                if idx + 1 < len(previous_chats) and previous_chats[idx]["role"] == "user" and previous_chats[idx + 1]["role"] == "assistant":
-                    indices_to_include.add(idx + 1)
-        sorted_indices = sorted(indices_to_include)
-        relevant_history = [previous_chats[i] for i in sorted_indices]
-        if len(relevant_history) < len(previous_chats):
-            logger.info(f"Filtered message history from {len(previous_chats)} to {len(relevant_history)} relevant messages")
+    if previous_chats:
+        # Take the last 10 messages (5 pairs) or all if fewer
+        max_messages = min(10, len(previous_chats))
+        relevant_history = previous_chats[-max_messages:]
+        logger.info(f"Using last {len(relevant_history)} messages for context (out of {len(previous_chats)} total)")
     else:
+        # If no previous chats, use empty history
         relevant_history = []
     
     start_time_retrieval = time.time()

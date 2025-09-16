@@ -83,8 +83,7 @@ Your output **MUST** be a valid JSON object.
   "rewritten_queries": {
     "metadata_query": "...",
     "natural_language_query": "..."
-  },
-  "relevant_history_indices": []
+  }
 }
 ```
 
@@ -110,8 +109,7 @@ Your output **MUST** be a valid JSON object.
       "rewritten_queries": {
         "metadata_query": "admission requirements eligibility criteria undergraduate bachelor BSc program",
         "natural_language_query": "What are the admission requirements for the undergraduate program at MBZUAI?"
-      },
-      "relevant_history_indices": []
+      }
     }
     ```
 
@@ -126,8 +124,7 @@ Your output **MUST** be a valid JSON object.
       "rewritten_queries": {
         "metadata_query": "faculty professors instructors computer science undergraduate bachelor BSc program",
         "natural_language_query": "Who are the faculty members for the undergraduate Computer Science program at MBZUAI?"
-      },
-      "relevant_history_indices": [0]
+      }
     }
     ```
 
@@ -143,7 +140,6 @@ Your output **MUST** be a valid JSON object.
         "metadata_query": "admission requirements eligibility criteria undergraduate bachelor BSc program application",
         "natural_language_query": "What are the admission requirements for the undergraduate program at MBZUAI?"
       },
-      "relevant_history_indices": [0]
     }
     ```
     **Note**: Even though "requirements" is ambiguous, the chat history shows the user is asking about application requirements for the undergraduate program, so we REWRITE instead of asking for clarification.
@@ -160,7 +156,6 @@ Your output **MUST** be a valid JSON object.
         "metadata_query": "requirements admission academic graduation application undergraduate bachelor BSc program",
         "natural_language_query": "What are the various requirements for the undergraduate program at MBZUAI?"
       },
-      "relevant_history_indices": []
     }
     ```
     **Note**: Even though "requirements" is ambiguous, we REWRITE to search broadly for all types of requirements rather than asking for clarification. The main response agent will handle intelligent clarification based on what documents are found.
@@ -176,7 +171,6 @@ Your output **MUST** be a valid JSON object.
         "metadata_query": "cost tuition fees housing accommodation living expenses undergraduate bachelor BSc program",
         "natural_language_query": "What are the various costs associated with the undergraduate program at MBZUAI?"
       },
-      "relevant_history_indices": []
     }
     ```
     **Note**: We REWRITE to search for all cost-related information rather than asking for clarification. The main response agent will provide comprehensive cost information or ask for specific clarification based on what's found.
@@ -192,7 +186,6 @@ Your output **MUST** be a valid JSON object.
         "metadata_query": "program overview structure curriculum courses admission undergraduate bachelor BSc",
         "natural_language_query": "What is the undergraduate program at MBZUAI and what does it include?"
       },
-      "relevant_history_indices": []
     }
     ```
     **Note**: We REWRITE to search broadly for program information rather than asking for clarification. The main response agent will provide comprehensive program information or ask for specific aspects based on what's found.
@@ -208,7 +201,6 @@ Your output **MUST** be a valid JSON object.
         "metadata_query": "internships program structure undergraduate bachelor BSc program",
         "natural_language_query": "Are internships part of the undergraduate program structure at MBZUAI?"
       },
-      "relevant_history_indices": []
     }
     ```
     **Note**: Even though the user mentioned "MBA applicant", the actual question is about internships and program structure, which are relevant to undergraduate programs. The agent should rewrite this to focus on the undergraduate program.
@@ -224,7 +216,6 @@ Your output **MUST** be a valid JSON object.
         "metadata_query": "undergraduate students financial support stipends scholarships bachelor BSc program",
         "natural_language_query": "What financial support and stipends are available for undergraduate students at MBZUAI?"
       },
-      "relevant_history_indices": []
     }
     ```
     **Note**: Even though the user mentioned "PhD stipends", we rewrite to focus on undergraduate financial support, which is relevant and available.
@@ -240,7 +231,6 @@ Your output **MUST** be a valid JSON object.
         "metadata_query": "undergraduate computer vision courses curriculum bachelor BSc program",
         "natural_language_query": "What computer vision courses are available in the undergraduate program at MBZUAI?"
       },
-      "relevant_history_indices": []
     }
     ```
     **Note**: We rewrite to focus on undergraduate computer vision education rather than graduate programs.
@@ -256,7 +246,6 @@ Your output **MUST** be a valid JSON object.
         "metadata_query": "undergraduate application process admission requirements bachelor BSc program",
         "natural_language_query": "How do I apply for the undergraduate program at MBZUAI?"
       },
-      "relevant_history_indices": []
     }
     ```
     **Note**: We rewrite to focus on undergraduate application process, which is what we can help with.
@@ -272,7 +261,6 @@ Your output **MUST** be a valid JSON object.
         "metadata_query": "application deadline undergraduate bachelor BSc program next year 2026",
         "natural_language_query": "What is the application deadline for the undergraduate program for next year's intake?"
       },
-      "relevant_history_indices": []
     }
     ```
 
@@ -330,8 +318,7 @@ async def query_rewriting_agent(question: str, language: str, message_history: L
                 "rewritten_queries": {
                     "metadata_query": rewritten_queries.get("metadata_query", question),
                     "natural_language_query": rewritten_queries.get("natural_language_query", question)
-                },
-                "relevant_history_indices": result.get("relevant_history_indices", [])
+                }
             }
         elif action in ["respond", "identity"]:
             return {
@@ -342,8 +329,7 @@ async def query_rewriting_agent(question: str, language: str, message_history: L
             # Fallback for any unexpected action
             return {
                 "action": "rewrite",
-                "rewritten_queries": {"metadata_query": question, "natural_language_query": question},
-                "relevant_history_indices": []
+                "rewritten_queries": {"metadata_query": question, "natural_language_query": question}
             }
 
     except Exception as e:
@@ -351,6 +337,5 @@ async def query_rewriting_agent(question: str, language: str, message_history: L
         # Fallback to using the original query for both indexes on error
         return {
             "action": "rewrite",
-            "rewritten_queries": {"metadata_query": question, "natural_language_query": question},
-            "relevant_history_indices": []
+            "rewritten_queries": {"metadata_query": question, "natural_language_query": question}
         }
