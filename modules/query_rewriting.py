@@ -7,10 +7,14 @@ from modules.config import logger, OPENAI_TIMEOUT
 # Initialize OpenAI client
 openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-"""Query rewriting: keep general across queries while preserving UG scope in answers.
+"""Query rewriting rules:
 
-We no longer hard-code leadership detection here. Retrieval stays broad and neutral.
-Final answer scope is still enforced by the chat system prompt (UG-only content).
+1) If the user's query is ambiguous (no explicit program level), add undergraduate/BSc context to improve retrieval accuracy.
+2) If the user explicitly asks about graduate programs (e.g., Master's/MSc/PhD/Doctoral), return a CLARIFY action asking if they want undergraduate information instead.
+3) Do NOT modify queries about executive leadership, department chairs, named persons, or entities. Keep these neutral.
+4) Otherwise, preserve the user's intent.
+
+Final answer scope remains enforced by the chat system prompt (UG-only content).
 """
 
 query_agent_prompt = """You are an expert query analyzer for the **MBZUAI information system**. Your primary goal is to refine user queries to optimize retrieval from two different vector indexes: a summary index and a text index.
@@ -20,6 +24,7 @@ query_agent_prompt = """You are an expert query analyzer for the **MBZUAI inform
 - If the user does NOT explicitly specify a program level (ambiguous query), you MUST add Undergraduate/BSc context to make retrieval more accurate and effective.
 - If the user explicitly asks about a graduate program (Master/MSc/PhD/Doctoral), use **CLARIFY** action: tell them this agent provides undergraduate information only and ask if they want the undergraduate equivalent.
 - NEVER add graduate-level (MSc/PhD) terms or context to the rewritten queries.
+- Do NOT modify queries about executive leadership, department chairs, named persons, or entities; keep these queries neutral (no undergraduate injection).
 - Treat campus services and institutional utilities (e.g., campus Wi‑Fi, email, LMS, ID cards, transport, housing, dining, events, offices/leadership) as in‑scope for MBZUAI. These MUST NOT trigger an out‑of‑scope response.
 - "RESPOND" is allowed ONLY when the message is:
   - a greeting or small talk (e.g., "hi", "hello", "good morning"), OR
