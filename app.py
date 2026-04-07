@@ -11,7 +11,14 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 # Import modules
-from modules.config import logger, validate_env_vars, get_system_prompt, RAG_APP_NAME, OPENAI_TIMEOUT
+from modules.config import (
+    logger,
+    validate_env_vars,
+    get_system_prompt,
+    RAG_APP_NAME,
+    OPENAI_TIMEOUT,
+    GENERATION_MODEL,
+)
 from modules.schemas import ChatRequest
 from modules.utils import safe_send, format_query
 from modules.citations import process_citations
@@ -84,6 +91,49 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def is_health_probe(request: Request) -> bool:
+    return request.headers.get("x-health-probe", "").lower() in {"1", "true", "yes"}
+
+
+def probe_failure_response(message: str, detail: str | None = None, status_code: int = 503) -> JSONResponse:
+    content = {
+        "status": "error",
+        "message": message,
+    }
+    if detail:
+        content["detail"] = detail[:200]
+    return JSONResponse(status_code=status_code, content=content)
+
+
+async def run_generation_probe() -> JSONResponse:
+    try:
+        completion = await openai_client.chat.completions.create(
+            model=GENERATION_MODEL,
+            messages=[
+                {"role": "system", "content": "Reply with exactly OK."},
+                {"role": "user", "content": "health check"},
+            ],
+            temperature=0,
+            max_tokens=6,
+            timeout=OPENAI_TIMEOUT,
+        )
+        reply = (completion.choices[0].message.content or "").strip()
+        if not reply:
+            return probe_failure_response("Generation probe returned an empty response")
+
+        return JSONResponse(
+            content={
+                "status": "healthy",
+                "message": "Generation path available",
+                "model": GENERATION_MODEL,
+                "reply": reply,
+            }
+        )
+    except Exception as exc:
+        logger.exception("Generation probe failed:")
+        return probe_failure_response("Generation probe failed", str(exc))
 
 # ------------------------------------------------------------------------------
 # Setup static files and templates
@@ -238,7 +288,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     
                     try:
                         completion = await openai_client.chat.completions.create(
-                            model="chatgpt-4o-latest",
+                            model=GENERATION_MODEL,
                             messages=messages,
                             temperature=0,
                             max_tokens=512,
@@ -322,7 +372,7 @@ async def websocket_endpoint(websocket: WebSocket):
             # Generate and stream the chat response
             try:
                 completion = await openai_client.chat.completions.create(
-                    model="chatgpt-4o-latest",
+                    model=GENERATION_MODEL,
                     messages=messages,
                     temperature=0,
                     max_tokens=1024,
@@ -446,9 +496,10 @@ async def websocket_endpoint(websocket: WebSocket):
 # HTTP endpoint for Telegram chat
 # ------------------------------------------------------------------------------
 @app.post("/telegram-chat")
-async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundTasks):
+async def telegram_chat(chat_request: ChatRequest, request: Request, background_tasks: BackgroundTasks):
     # Extract the question and language from the validated request body.
     logger.info(f"Received telegram chat request: {chat_request}")
+    is_probe_request = is_health_probe(request)
     
     question = chat_request.question
     language = chat_request.language
@@ -459,6 +510,11 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
     
     # Handle direct responses (out of scope queries)
     if agent_result["action"] in ["respond"]:
+        if is_probe_request:
+            return probe_failure_response(
+                "Synthetic probe was handled as a non-answer path",
+                agent_result.get("response"),
+            )
         return {
             "response": agent_result["response"],
             "sources": []
@@ -494,6 +550,8 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
         )
         if not docs:
             logger.warning("No documents found in Pinecone for the query.")
+            if is_probe_request:
+                return probe_failure_response("Synthetic probe retrieved no documents")
             # Use main response generation agent to provide intelligent clarification
             try:
                 # Prepare messages for clarification response
@@ -502,7 +560,7 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
                 messages.append({"role": "user", "content": f"Query: {question}\nLanguage: {language}\n\nI searched our MBZUAI knowledge base but couldn't find relevant documents to answer this question. Please provide an intelligent clarification response that explains what I searched for and asks for specific details to help the user refine their question."})
                 
                 completion = await openai_client.chat.completions.create(
-                    model="chatgpt-4o-latest",
+                    model=GENERATION_MODEL,
                     messages=messages,
                     temperature=0,
                     max_tokens=512,
@@ -514,19 +572,24 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
                 chat_str_id = str(uuid.uuid4())
                 
                 # Save the clarification response to the database
-                try:
-                    asyncio.create_task(
-                        ChatRepository.save_chat(app.state.pool, question, clarification_response, [], chat_str_id, RAG_APP_NAME)
-                    )
-                except Exception as e:
-                    logger.exception(f"Failed to schedule clarification response save: {e}")
+                if not is_probe_request:
+                    try:
+                        asyncio.create_task(
+                            ChatRepository.save_chat(app.state.pool, question, clarification_response, [], chat_str_id, RAG_APP_NAME)
+                        )
+                    except Exception as e:
+                        logger.exception(f"Failed to schedule clarification response save: {e}")
                 
                 return {"response": clarification_response, "sources": [], "id": chat_str_id}
             except Exception as e:
                 logger.exception("Error generating clarification response:")
+                if is_probe_request:
+                    return probe_failure_response("Clarification generation failed during probe", str(e))
                 return {"response": "I couldn't find relevant information and had trouble generating a clarification response. Please try rephrasing your question with more specific details.", "sources": [], "id": str(uuid.uuid4())}
     except Exception as e:
         logger.exception("Failed to fetch documents from Pinecone.")
+        if is_probe_request:
+            return probe_failure_response("Document retrieval failed during probe", str(e))
         return JSONResponse(
             status_code=500,
             content={"response": "Something went wrong. Please try again.", "sources": [], "id": str(uuid.uuid4())}
@@ -545,6 +608,8 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
         ranked_docs = [] # No docs to rerank
 
     if not ranked_docs:
+        if is_probe_request:
+            return probe_failure_response("Synthetic probe returned no ranked documents")
         return {
             "response": "No relevant information found to answer your question.",
             "sources": []
@@ -561,7 +626,7 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
     # Generate and stream the chat response.
     try:
         completion = await openai_client.chat.completions.create(
-            model="chatgpt-4o-latest",
+            model=GENERATION_MODEL,
             messages=messages,
             temperature=0,
             max_tokens=1024,
@@ -587,6 +652,8 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
                 cleaned_answer += cleaned_content
     except Exception as e:
         logger.exception("Error during streaming response:")
+        if is_probe_request:
+            return probe_failure_response("Response generation failed during probe", str(e))
         return {
             "response": "Response generation failed. Please try again later.",
             "sources": []
@@ -594,6 +661,8 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
 
     # If the initial response indicates no answer, return a clear failure message.
     if not isResponseAvailable:
+        if is_probe_request:
+            return probe_failure_response("Synthetic probe did not yield a confident answer")
         return {
             "response": "I couldn’t generate a confident answer right now. Try rephrasing with more details (e.g., program, year, topic) or ask a simpler version.",
             "sources": []
@@ -631,13 +700,14 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
     chat_str_id = str(uuid.uuid4())
     
     # Save chat asynchronously without blocking response
-    try:
-        logger.info(f"Saving chat with {len(citations)} citations (HTTP path)")
-        asyncio.create_task(
-            ChatRepository.save_chat(app.state.pool, question, updated_answer, citations, chat_str_id, RAG_APP_NAME)
-        )
-    except Exception as e:
-        logger.exception(f"Failed to schedule chat save task: {e}")
+    if not is_probe_request:
+        try:
+            logger.info(f"Saving chat with {len(citations)} citations (HTTP path)")
+            asyncio.create_task(
+                ChatRepository.save_chat(app.state.pool, question, updated_answer, citations, chat_str_id, RAG_APP_NAME)
+            )
+        except Exception as e:
+            logger.exception(f"Failed to schedule chat save task: {e}")
 
     # Return the response immediately without waiting for database operation
     return {"response": updated_answer, "sources": citations, "id": chat_str_id}
@@ -687,6 +757,25 @@ async def health(request: Request):
                 content={"status": "error", "message": "Pinecone indexes not initialized"}
             )
             
+        try:
+            await openai_client.models.retrieve(GENERATION_MODEL)
+            generation_model_status = "available"
+        except Exception as model_err:
+            logger.error(f"Generation model health check failed: {model_err}")
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "status": "error",
+                    "message": f"Generation model unavailable: {str(model_err)[:100]}...",
+                    "components": {
+                        "embedding_model": "initialized",
+                        "pinecone": "connected",
+                        "database": db_status,
+                        "generation_model": "error",
+                    },
+                },
+            )
+
         # Return success if all checks pass
         return JSONResponse(
             content={
@@ -695,8 +784,9 @@ async def health(request: Request):
                 "components": {
                     "embedding_model": "initialized",
                     "pinecone": "connected",
-                    "database": db_status
-                }
+                    "database": db_status,
+                    "generation_model": generation_model_status,
+                },
             },
             media_type="application/json"
         )
@@ -706,3 +796,8 @@ async def health(request: Request):
             status_code=500,
             content={"status": "error", "message": str(e)}
         )
+
+
+@app.get("/health/generation")
+async def health_generation():
+    return await run_generation_probe()

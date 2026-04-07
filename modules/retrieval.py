@@ -18,6 +18,7 @@ from modules.config import (
     RERANKER_TOP_N,
     TOTAL_DOCS_TO_RERANK,
     OPENAI_TIMEOUT,
+    RERANKING_MODEL,
     HYBRID_ALPHA,
     EMBEDDING_MODEL_NAME,
     BM25_FILE_PATH,
@@ -201,7 +202,7 @@ async def openai_rerank_and_filter_docs(query: str, original_docs: List[Dict[str
     for attempt in range(MAX_RETRIES):
         try:
             response = await client.chat.completions.create(
-                model="gpt-4.1-nano",
+                model=RERANKING_MODEL,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}

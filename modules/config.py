@@ -40,6 +40,9 @@ TOTAL_DOCS_TO_RERANK = int(os.getenv("TOTAL_DOCS_TO_RERANK", 20))
 
 # OpenAI request timeout (seconds)
 OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "30"))
+GENERATION_MODEL = os.getenv("GENERATION_MODEL", "gpt-4.1-mini")
+QUERY_REWRITING_MODEL = os.getenv("QUERY_REWRITING_MODEL", "gpt-4.1-mini")
+RERANKING_MODEL = os.getenv("RERANKING_MODEL", "gpt-4.1-nano")
 
 # Hybrid search weighting and embedding model configuration
 HYBRID_ALPHA = float(os.getenv("HYBRID_ALPHA", "0.5"))
