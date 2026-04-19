@@ -4,6 +4,8 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,13 +13,45 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 # Import modules
-from modules.config import logger, validate_env_vars, get_system_prompt, RAG_APP_NAME, OPENAI_TIMEOUT
+from modules.config import (
+    logger,
+    validate_env_vars,
+    get_system_prompt,
+    RAG_APP_NAME,
+    OPENAI_TIMEOUT,
+    GENERATION_MODEL,
+    QUERY_REWRITE_MODEL,
+    MAX_GENERATION_TOKENS,
+    EMBEDDING_MODEL_NAME,
+    SERVICE_IDENTIFIER,
+    SERVICE_DISPLAY_NAME,
+    SERVICE_TYPE,
+    SERVICE_ENVIRONMENT,
+    HEALTH_PROBE_QUERY,
+    HEALTH_PROBE_LANGUAGE,
+    HEALTH_PROBE_TOP_DOCS,
+    RELEASE_VERSION,
+    RELEASE_COMMIT_SHA,
+    RELEASE_DEPLOYED_AT,
+    SERVICE_OWNER,
+    RUNBOOK_URL,
+    DASHBOARD_SERVICE_ID,
+    REPOSITORY_URL,
+    PUBLIC_BASE_URL,
+)
 from modules.schemas import ChatRequest
 from modules.utils import safe_send, format_query
 from modules.citations import process_citations
 from modules.retrieval import initialize_retrieval_components, rerank_docs, fetch_balanced_documents
 from pinecone import Pinecone
 from modules.query_rewriting import query_rewriting_agent, openai_client
+from modules.monitoring import (
+    CONTRACT_VERSION,
+    HEALTHY,
+    UNHEALTHY,
+    build_contract_payload,
+    health_status_code,
+)
 
 # Import database modules
 from modules.database.database import init_db, connect_db, disconnect_db
@@ -238,10 +272,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     
                     try:
                         completion = await openai_client.chat.completions.create(
-                            model="chatgpt-4o-latest",
+                            model=GENERATION_MODEL,
                             messages=messages,
                             temperature=0,
-                            max_tokens=512,
+                            max_tokens=min(512, MAX_GENERATION_TOKENS),
                             timeout=OPENAI_TIMEOUT,
                         )
                         clarification_response = completion.choices[0].message.content
@@ -322,10 +356,10 @@ async def websocket_endpoint(websocket: WebSocket):
             # Generate and stream the chat response
             try:
                 completion = await openai_client.chat.completions.create(
-                    model="chatgpt-4o-latest",
+                    model=GENERATION_MODEL,
                     messages=messages,
                     temperature=0,
-                    max_tokens=1024,
+                    max_tokens=MAX_GENERATION_TOKENS,
                     stream=True,
                     timeout=OPENAI_TIMEOUT,
                 )
@@ -502,10 +536,10 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
                 messages.append({"role": "user", "content": f"Query: {question}\nLanguage: {language}\n\nI searched our MBZUAI knowledge base but couldn't find relevant documents to answer this question. Please provide an intelligent clarification response that explains what I searched for and asks for specific details to help the user refine their question."})
                 
                 completion = await openai_client.chat.completions.create(
-                    model="chatgpt-4o-latest",
+                    model=GENERATION_MODEL,
                     messages=messages,
                     temperature=0,
-                    max_tokens=512,
+                    max_tokens=min(512, MAX_GENERATION_TOKENS),
                     timeout=OPENAI_TIMEOUT,
                 )
                 clarification_response = completion.choices[0].message.content
@@ -561,10 +595,10 @@ async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundT
     # Generate and stream the chat response.
     try:
         completion = await openai_client.chat.completions.create(
-            model="chatgpt-4o-latest",
+            model=GENERATION_MODEL,
             messages=messages,
             temperature=0,
-            max_tokens=1024,
+            max_tokens=MAX_GENERATION_TOKENS,
             stream=True,
             timeout=OPENAI_TIMEOUT,
         )
@@ -654,55 +688,379 @@ async def root():
 async def api_root():
     return JSONResponse(content={"message": "API is working"})
 
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _component_payload(status: str, *, error: Optional[str] = None, **details: Any) -> dict:
+    payload = {"status": status}
+    if error:
+        payload["error"] = error
+    for key, value in details.items():
+        if value is not None:
+            payload[key] = value
+    return payload
+
+
+def _aggregate_status(checks: dict[str, dict]) -> str:
+    statuses = [check.get("status", "unhealthy") for check in checks.values()]
+    if any(status == "unhealthy" for status in statuses):
+        return "unhealthy"
+    if any(status == "degraded" for status in statuses):
+        return "degraded"
+    return "healthy"
+
+
+def _status_code_for(status: str) -> int:
+    return 200 if status in {"healthy", "degraded"} else 503
+
+
+def _release_metadata_contract() -> dict:
+    release = {
+        "version": RELEASE_VERSION or "unknown",
+    }
+    if RELEASE_COMMIT_SHA and RELEASE_COMMIT_SHA != "unknown":
+        release["commitSha"] = RELEASE_COMMIT_SHA
+    if RELEASE_DEPLOYED_AT and RELEASE_DEPLOYED_AT != "unknown":
+        release["deployedAt"] = RELEASE_DEPLOYED_AT
+    return release
+
+
+def _operations_metadata() -> dict:
+    metadata = {
+        "owner": SERVICE_OWNER,
+        "runbook_url": RUNBOOK_URL,
+        "dashboard_service_id": DASHBOARD_SERVICE_ID,
+        "repository_url": REPOSITORY_URL,
+        "public_base_url": PUBLIC_BASE_URL,
+    }
+    return {key: value for key, value in metadata.items() if value}
+
+
+def _build_contract_summary(status: str, endpoint: str) -> str:
+    if status == HEALTHY:
+        return f"{endpoint} checks passed"
+    if status == "degraded":
+        return f"{endpoint} checks degraded"
+    if status == UNHEALTHY:
+        return f"{endpoint} checks failed"
+    return f"{endpoint} status unknown"
+
+
+def _contract_response(
+    *,
+    endpoint_label: str,
+    checks: dict[str, dict],
+    status: Optional[str] = None,
+    journey: Optional[dict] = None,
+) -> JSONResponse:
+    resolved_status = status or _aggregate_status(checks)
+    payload = build_contract_payload(
+        service_id=SERVICE_IDENTIFIER,
+        service_name=SERVICE_DISPLAY_NAME,
+        service_type=SERVICE_TYPE,
+        environment=SERVICE_ENVIRONMENT,
+        checks=checks,
+        journey=journey,
+        release=_release_metadata_contract(),
+        operations=_operations_metadata(),
+        summary=_build_contract_summary(resolved_status, endpoint_label),
+        status=resolved_status,
+    )
+    return JSONResponse(status_code=health_status_code(resolved_status), content=payload)
+
+
+async def _check_database(pool: Any) -> dict:
+    if not pool or getattr(pool, "closed", False):
+        return _component_payload("unhealthy", error="database pool is closed or not initialized")
+    try:
+        started = time.perf_counter()
+        async with pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        return _component_payload("healthy", latency_ms=round((time.perf_counter() - started) * 1000, 2))
+    except Exception as exc:
+        logger.error(f"Database health check failed: {exc}")
+        return _component_payload("unhealthy", error=str(exc))
+
+
+def _check_embedding_model(app_state: Any) -> dict:
+    embed_model = getattr(app_state, "embed_model", None)
+    if not embed_model:
+        return _component_payload("unhealthy", error="embedding model not initialized", model=EMBEDDING_MODEL_NAME)
+    return _component_payload("healthy", model=EMBEDDING_MODEL_NAME)
+
+
+def _check_openai_configuration() -> dict:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return _component_payload("unhealthy", error="OPENAI_API_KEY is not configured")
+    if not GENERATION_MODEL:
+        return _component_payload("unhealthy", error="GENERATION_MODEL is not configured")
+    return _component_payload(
+        "healthy",
+        generation_model=GENERATION_MODEL,
+        query_rewrite_model=QUERY_REWRITE_MODEL,
+    )
+
+
+def _check_query_rewrite_configuration() -> dict:
+    return _component_payload(
+        "healthy",
+        model=QUERY_REWRITE_MODEL,
+    )
+
+
+def _check_vector_store_presence(app_state: Any) -> dict:
+    summary_index = getattr(app_state, "pinecone_summary_index", None)
+    text_index = getattr(app_state, "pinecone_text_index", None)
+    summary_index_name = os.getenv("PINECONE_SUMMARY_INDEX_NAME", "mbzuai-undergraduate-summary-only-index")
+    text_index_name = os.getenv("PINECONE_TEXT_INDEX_NAME", "mbzuai-undergraduate-text-only-index")
+
+    if not summary_index or not text_index:
+        return _component_payload(
+            "unhealthy",
+            error="one or more Pinecone indexes are not initialized",
+            summary_index=summary_index_name,
+            text_index=text_index_name,
+        )
+    return _component_payload(
+        "healthy",
+        summary_index=summary_index_name,
+        text_index=text_index_name,
+    )
+
+
+async def _probe_pinecone_index(index: Any, index_name: str) -> dict:
+    if not index:
+        return _component_payload("unhealthy", error=f"{index_name} is not initialized")
+    describe_index_stats = getattr(index, "describe_index_stats", None)
+    if not callable(describe_index_stats):
+        return _component_payload("degraded", error=f"{index_name} does not expose describe_index_stats")
+    try:
+        stats = await asyncio.to_thread(describe_index_stats)
+        namespace_count = None
+        if isinstance(stats, dict):
+            namespace_count = len(stats.get("namespaces", {}))
+        return _component_payload("healthy", namespaces=namespace_count)
+    except Exception as exc:
+        logger.error(f"Pinecone health check failed for {index_name}: {exc}")
+        return _component_payload("unhealthy", error=str(exc))
+
+
+async def _check_vector_store(app_state: Any, *, detailed: bool) -> dict:
+    base = _check_vector_store_presence(app_state)
+    if not detailed or base["status"] == "unhealthy":
+        return base
+
+    summary_index_name = os.getenv("PINECONE_SUMMARY_INDEX_NAME", "mbzuai-undergraduate-summary-only-index")
+    text_index_name = os.getenv("PINECONE_TEXT_INDEX_NAME", "mbzuai-undergraduate-text-only-index")
+    summary_check, text_check = await asyncio.gather(
+        _probe_pinecone_index(getattr(app_state, "pinecone_summary_index", None), summary_index_name),
+        _probe_pinecone_index(getattr(app_state, "pinecone_text_index", None), text_index_name),
+    )
+    nested = {"summary": summary_check, "text": text_check}
+    return _component_payload(
+        _aggregate_status(nested),
+        indexes=nested,
+        summary_index=summary_index_name,
+        text_index=text_index_name,
+    )
+
+
+async def _build_health_payload(request: Request, *, detailed: bool) -> dict:
+    checks = {
+        "database": await _check_database(getattr(request.app.state, "pool", None)),
+        "embedding_model": _check_embedding_model(request.app.state),
+        "vector_store": await _check_vector_store(request.app.state, detailed=detailed),
+        "openai": _check_openai_configuration(),
+        "query_rewrite": _check_query_rewrite_configuration(),
+    }
+    return {
+        "status": _aggregate_status(checks),
+        "checks": checks,
+    }
+
+
+async def _run_generation_probe(request: Request) -> dict:
+    checks = {
+        "database": await _check_database(getattr(request.app.state, "pool", None)),
+        "embedding_model": _check_embedding_model(request.app.state),
+        "vector_store": _check_vector_store_presence(request.app.state),
+        "openai": _check_openai_configuration(),
+        "query_rewrite": _component_payload("degraded", error="probe not executed"),
+        "retrieval": _component_payload("degraded", error="probe not executed"),
+        "generation": _component_payload("degraded", error="probe not executed", model=GENERATION_MODEL),
+    }
+    preflight = _aggregate_status(
+        {
+            "database": checks["database"],
+            "embedding_model": checks["embedding_model"],
+            "vector_store": checks["vector_store"],
+            "openai": checks["openai"],
+        }
+    )
+    if preflight == "unhealthy":
+        return {"status": "unhealthy", "checks": checks}
+
+    agent_result = await query_rewriting_agent(
+        question=HEALTH_PROBE_QUERY,
+        language=HEALTH_PROBE_LANGUAGE,
+        message_history=[],
+    )
+    action = agent_result.get("action")
+    checks["query_rewrite"] = _component_payload(
+        "healthy" if action == "rewrite" else "unhealthy",
+        model=QUERY_REWRITE_MODEL,
+        action=action,
+        error=None if action == "rewrite" else f"probe did not exercise retrieval path (action={action})",
+    )
+    if action != "rewrite":
+        return {"status": "unhealthy", "checks": checks}
+
+    rewritten_queries = agent_result.get("rewritten_queries") or {
+        "metadata_query": HEALTH_PROBE_QUERY,
+        "natural_language_query": HEALTH_PROBE_QUERY,
+    }
+    try:
+        docs = await fetch_balanced_documents(
+            rewritten_queries=rewritten_queries,
+            pinecone_summary_index=request.app.state.pinecone_summary_index,
+            pinecone_text_index=request.app.state.pinecone_text_index,
+            embed_model=request.app.state.embed_model,
+            bm25_encoder=request.app.state.bm25_encoder,
+        )
+    except Exception as exc:
+        checks["vector_store"] = _component_payload("unhealthy", error=str(exc))
+        checks["retrieval"] = _component_payload("unhealthy", error=str(exc))
+        return {"status": "unhealthy", "checks": checks}
+
+    if not docs:
+        checks["retrieval"] = _component_payload("unhealthy", error="probe returned no documents")
+        return {"status": "unhealthy", "checks": checks}
+    checks["retrieval"] = _component_payload("healthy", documents=len(docs))
+
+    natural_language_query = rewritten_queries.get("natural_language_query", HEALTH_PROBE_QUERY)
+    ranked_docs = await rerank_docs(natural_language_query, docs)
+    if not ranked_docs:
+        checks["retrieval"] = _component_payload("unhealthy", error="reranker returned no documents")
+        return {"status": "unhealthy", "checks": checks}
+
+    messages = [
+        {"role": "system", "content": get_system_prompt()},
+        {
+            "role": "user",
+            "content": format_query(
+                HEALTH_PROBE_QUERY,
+                HEALTH_PROBE_LANGUAGE,
+                ranked_docs[: max(1, HEALTH_PROBE_TOP_DOCS)],
+            ),
+        },
+    ]
+    try:
+        completion = await openai_client.chat.completions.create(
+            model=GENERATION_MODEL,
+            messages=messages,
+            temperature=0.0,
+            max_tokens=min(128, MAX_GENERATION_TOKENS),
+            stream=False,
+            timeout=OPENAI_TIMEOUT,
+        )
+        message = completion.choices[0].message.content if completion and completion.choices else ""
+        generated_text = (message or "").strip()
+    except Exception as exc:
+        checks["openai"] = _component_payload(
+            "unhealthy",
+            error=str(exc),
+            generation_model=GENERATION_MODEL,
+            query_rewrite_model=QUERY_REWRITE_MODEL,
+        )
+        checks["generation"] = _component_payload("unhealthy", error=str(exc), model=GENERATION_MODEL)
+        return {"status": "unhealthy", "checks": checks}
+
+    if not generated_text:
+        checks["generation"] = _component_payload(
+            "unhealthy",
+            error="generation returned no usable text",
+            model=GENERATION_MODEL,
+        )
+        return {"status": "unhealthy", "checks": checks}
+
+    checks["generation"] = _component_payload(
+        "healthy",
+        model=GENERATION_MODEL,
+        preview=generated_text[:160],
+    )
+    return {"status": _aggregate_status(checks), "checks": checks}
+
+
 @app.get("/health")
 async def health(request: Request):
-    # Add a database connection check
-    db_status = "connected"
-    db_message = "Database connection successful."
-    pool = request.app.state.pool
-    if not pool or getattr(pool, "closed", False):
-         db_status = "disconnected"
-         db_message = "Database pool is closed or not initialized."
-    else:
-        try:
-            # Try a simple query
-            async with pool.acquire() as conn:
-                await conn.fetchval('SELECT 1')
-        except Exception as db_err:
-            logger.error(f"Database health check failed: {db_err}")
-            db_status = "error"
-            db_message = f"Database connection error: {str(db_err)[:100]}..."
-            
-    try:
-        # Check if components are loaded in app.state
-        if not hasattr(request.app.state, 'embed_model') or not request.app.state.embed_model:
-            return JSONResponse(
-                status_code=500,
-                content={"status": "error", "message": "Embedding model not initialized"}
-            )
-        
-        if not hasattr(request.app.state, 'pinecone_summary_index') or not hasattr(request.app.state, 'pinecone_text_index'):
-            return JSONResponse(
-                status_code=500,
-                content={"status": "error", "message": "Pinecone indexes not initialized"}
-            )
-            
-        # Return success if all checks pass
-        return JSONResponse(
-            content={
-                "status": "healthy",
-                "message": "API is operational",
-                "components": {
-                    "embedding_model": "initialized",
-                    "pinecone": "connected",
-                    "database": db_status
-                }
-            },
-            media_type="application/json"
-        )
-    except Exception as e:
-        logger.exception("Health check failed:")
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e)}
-        )
+    return await health_ready(request)
+
+
+@app.get("/health/live")
+async def health_live(request: Request):
+    checks = {
+        "application": _component_payload("healthy"),
+        "process": _component_payload("healthy", pid=os.getpid()),
+        "contract": _component_payload("healthy", version=CONTRACT_VERSION),
+    }
+    return _contract_response(endpoint_label="live", checks=checks, status="healthy")
+
+
+@app.get("/health/ready")
+async def health_ready(request: Request):
+    payload = await _build_health_payload(request, detailed=False)
+    return _contract_response(
+        endpoint_label="ready",
+        checks=payload["checks"],
+        status=payload["status"],
+    )
+
+
+@app.get("/health/detailed")
+async def health_detailed(request: Request):
+    payload = await _build_health_payload(request, detailed=True)
+    return _contract_response(
+        endpoint_label="detailed",
+        checks=payload["checks"],
+        status=payload["status"],
+    )
+
+
+@app.get("/health/generation")
+async def health_generation(request: Request):
+    payload = await _run_generation_probe(request)
+    return JSONResponse(status_code=_status_code_for(payload["status"]), content=payload)
+
+
+@app.get("/health/journey")
+async def health_journey(request: Request):
+    started = time.perf_counter()
+    probe_payload = await _run_generation_probe(request)
+    probe_status = probe_payload.get("status", "unhealthy")
+    probe_checks = probe_payload.get("checks", {})
+    duration_ms = int((time.perf_counter() - started) * 1000)
+
+    generation_message = None
+    if isinstance(probe_checks, dict):
+        generation_message = probe_checks.get("generation", {}).get("error")
+        if not generation_message:
+            generation_message = probe_checks.get("generation", {}).get("preview")
+
+    journey = {
+        "name": "rag_generation",
+        "status": probe_status if isinstance(probe_status, str) else "unhealthy",
+        "probeModeSupported": True,
+        "sideEffects": "none",
+        "durationMs": duration_ms,
+    }
+    if generation_message:
+        journey["message"] = str(generation_message)[:200]
+
+    return _contract_response(
+        endpoint_label="journey",
+        checks=probe_checks if isinstance(probe_checks, dict) else {},
+        status=probe_status if isinstance(probe_status, str) else "unhealthy",
+        journey=journey,
+    )
