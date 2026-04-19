@@ -41,10 +41,36 @@ TOTAL_DOCS_TO_RERANK = int(os.getenv("TOTAL_DOCS_TO_RERANK", 20))
 # OpenAI request timeout (seconds)
 OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "30"))
 
+# LLM model configuration
+QUERY_REWRITE_MODEL = os.getenv("QUERY_REWRITE_MODEL", "gpt-4.1-mini")
+GENERATION_MODEL = os.getenv("GENERATION_MODEL", "chatgpt-4o-latest")
+MAX_GENERATION_TOKENS = int(os.getenv("MAX_GENERATION_TOKENS", "1024"))
+
 # Hybrid search weighting and embedding model configuration
 HYBRID_ALPHA = float(os.getenv("HYBRID_ALPHA", "0.5"))
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "Qwen/Qwen3-Embedding-0.6B")
 BM25_FILE_PATH = os.getenv("BM25_FILE_PATH", "./MBZUAI_BM25_ENCODER.json")
+
+# Monitoring / service metadata
+SERVICE_IDENTIFIER = os.getenv("SERVICE_IDENTIFIER", "mbzuai-ug-chatbot")
+SERVICE_DISPLAY_NAME = os.getenv("SERVICE_DISPLAY_NAME", "MBZUAI Undergraduate Chatbot")
+SERVICE_TYPE = os.getenv("SERVICE_TYPE", "rag")
+SERVICE_ENVIRONMENT = os.getenv("SERVICE_ENVIRONMENT", os.getenv("ENVIRONMENT", "unknown"))
+HEALTH_PROBE_QUERY = os.getenv("HEALTH_PROBE_QUERY", "What are the MBZUAI undergraduate admission requirements?")
+HEALTH_PROBE_LANGUAGE = os.getenv("HEALTH_PROBE_LANGUAGE", "English")
+HEALTH_PROBE_TOP_DOCS = int(os.getenv("HEALTH_PROBE_TOP_DOCS", "3"))
+
+# Release metadata
+RELEASE_VERSION = os.getenv("RELEASE_VERSION")
+RELEASE_COMMIT_SHA = os.getenv("RELEASE_COMMIT_SHA")
+RELEASE_DEPLOYED_AT = os.getenv("RELEASE_DEPLOYED_AT")
+
+# Ownership / operations metadata
+SERVICE_OWNER = os.getenv("SERVICE_OWNER")
+RUNBOOK_URL = os.getenv("RUNBOOK_URL")
+DASHBOARD_SERVICE_ID = os.getenv("DASHBOARD_SERVICE_ID")
+REPOSITORY_URL = os.getenv("REPOSITORY_URL")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
 
 # Validate required environment variables
 def validate_env_vars():
