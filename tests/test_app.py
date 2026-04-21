@@ -1,6 +1,7 @@
 import importlib
 from pathlib import Path
 import sys
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -37,6 +38,21 @@ class FakePinecone:
 
     def Index(self, name: str):
         return {"index_name": name}
+
+
+class _FakeMessage:
+    def __init__(self, content: str):
+        self.content = content
+
+
+class _FakeChoice:
+    def __init__(self, content: str):
+        self.message = _FakeMessage(content)
+
+
+class _FakeCompletion:
+    def __init__(self, content: str):
+        self.choices = [_FakeChoice(content)]
 
 
 @pytest.fixture
@@ -101,13 +117,64 @@ def test_health_endpoint_reports_models(client):
     }
 
 
-def test_telegram_endpoint_removed(client):
+def test_telegram_endpoint_available_and_returns_direct_response(client, monkeypatch):
+    import app as app_module
+
+    monkeypatch.setattr(
+        app_module,
+        "query_rewriting_agent",
+        AsyncMock(return_value={"action": "respond", "response": "Hello from UG assistant."}),
+    )
+    monkeypatch.setattr(app_module.ChatRepository, "save_chat", AsyncMock(return_value=1))
+
     response = client.post(
         "/telegram-chat",
         json={"question": "hello", "language": "en", "previous_chats": []},
     )
 
-    assert response.status_code == 404
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["response"] == "Hello from UG assistant."
+    assert payload["sources"] == []
+    assert payload["id"]
+
+
+def test_telegram_probe_fails_if_rewrite_path_not_exercised(client, monkeypatch):
+    import app as app_module
+
+    monkeypatch.setattr(
+        app_module,
+        "query_rewriting_agent",
+        AsyncMock(return_value={"action": "respond", "response": "Hello from UG assistant."}),
+    )
+
+    response = client.post(
+        "/telegram-chat",
+        headers={"x-health-probe": "true"},
+        json={"question": "hello", "language": "en", "previous_chats": []},
+    )
+
+    payload = response.json()
+    assert response.status_code == 503
+    assert payload["status"] == "unhealthy"
+    assert payload["error"] == "probe_bypassed_generation"
+
+
+def test_generation_health_endpoint_reports_healthy(client, monkeypatch):
+    import app as app_module
+
+    monkeypatch.setattr(
+        app_module.openai_client.chat.completions,
+        "create",
+        AsyncMock(return_value=_FakeCompletion("OK")),
+    )
+
+    response = client.get("/health/generation")
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["status"] == "healthy"
+    assert payload["checks"]["generation"]["status"] == "healthy"
 
 
 def test_websocket_invalid_payload_returns_validation_error(client):

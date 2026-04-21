@@ -4,6 +4,8 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -107,6 +109,41 @@ base_dir = os.path.dirname(os.path.abspath(__file__))
 # Include database history router (endpoints within will need async updates too)
 # ------------------------------------------------------------------------------
 app.include_router(history_router, prefix="/api")
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _is_health_probe(headers: Any) -> bool:
+    try:
+        value = headers.get("x-health-probe") if hasattr(headers, "get") else None
+        if value is None and isinstance(headers, dict):
+            value = headers.get("x-health-probe") or headers.get("X-Health-Probe")
+        return str(value or "").strip().lower() in {"1", "true", "yes"}
+    except Exception:
+        return False
+
+
+def _extract_completion_text(completion: Any) -> str:
+    if completion and getattr(completion, "choices", None):
+        message = completion.choices[0].message
+        return (getattr(message, "content", None) or "").strip()
+    return ""
+
+
+def _probe_error_response(error_code: str, message: str, *, details: Optional[str] = None) -> JSONResponse:
+    payload = {
+        "status": "unhealthy",
+        "probe": True,
+        "timestamp": _utc_timestamp(),
+        "error": error_code,
+        "message": message,
+        "sources": [],
+    }
+    if details:
+        payload["details"] = details
+    return JSONResponse(status_code=503, content=payload)
 
 # ------------------------------------------------------------------------------
 # WebSocket endpoint for chat functionality with improved error handling
@@ -455,6 +492,120 @@ async def websocket_endpoint(websocket: WebSocket):
             break
 
 # ------------------------------------------------------------------------------
+# HTTP endpoint for Telegram chat
+# ------------------------------------------------------------------------------
+@app.post("/telegram-chat")
+async def telegram_chat(chat_request: ChatRequest, request: Request):
+    question = chat_request.question
+    language = chat_request.language
+    previous_chats = chat_request.previous_chats
+    probe_mode = _is_health_probe(request.headers)
+
+    agent_result = await query_rewriting_agent(question, language, previous_chats)
+
+    if agent_result["action"] in ["respond", "identity"]:
+        if probe_mode:
+            return _probe_error_response(
+                "probe_bypassed_generation",
+                f"Probe did not exercise retrieval/generation path (action={agent_result['action']}).",
+            )
+        direct_response = agent_result.get("response", "I can only answer MBZUAI undergraduate related questions.")
+        chat_str_id = str(uuid.uuid4())
+        try:
+            await ChatRepository.save_chat(request.app.state.pool, question, direct_response, [], chat_str_id, RAG_APP_NAME)
+        except Exception as exc:
+            logger.exception(f"Failed to persist direct response: {exc}")
+        return {"response": direct_response, "sources": [], "id": chat_str_id}
+
+    rewritten_queries = agent_result.get("rewritten_queries") or {
+        "metadata_query": question,
+        "natural_language_query": question,
+    }
+
+    try:
+        docs = await fetch_balanced_documents(
+            rewritten_queries=rewritten_queries,
+            pinecone_summary_index=request.app.state.pinecone_summary_index,
+            pinecone_text_index=request.app.state.pinecone_text_index,
+            embed_model=request.app.state.embed_model,
+            bm25_encoder=request.app.state.bm25_encoder,
+        )
+    except Exception as exc:
+        logger.exception("Failed to fetch documents from Pinecone.")
+        if probe_mode:
+            return _probe_error_response("retrieval_failure", "Probe failed during retrieval.", details=str(exc))
+        return JSONResponse(
+            status_code=500,
+            content={"response": "Something went wrong while retrieving documents. Please try again.", "sources": [], "id": str(uuid.uuid4())},
+        )
+
+    if not docs:
+        if probe_mode:
+            return _probe_error_response("documents_not_found", "Probe failed because retrieval returned no documents.")
+        return JSONResponse(
+            status_code=404,
+            content={"response": "No relevant information found to answer your question.", "sources": [], "id": str(uuid.uuid4())},
+        )
+
+    ranked_docs = await rerank_docs(
+        rewritten_queries.get("natural_language_query", question),
+        docs,
+        is_time_sensitive=agent_result.get("is_time_sensitive", False),
+    )
+    if not ranked_docs:
+        if probe_mode:
+            return _probe_error_response("reranker_failure", "Probe failed because reranking returned no documents.")
+        return JSONResponse(
+            status_code=500,
+            content={"response": "No relevant information found to answer your question.", "sources": [], "id": str(uuid.uuid4())},
+        )
+
+    relevant_history = previous_chats[-10:] if previous_chats else []
+    messages = [{"role": "system", "content": get_system_prompt()}]
+    messages.extend(relevant_history)
+    messages.append({"role": "user", "content": format_query(question, language, ranked_docs)})
+
+    try:
+        completion = await openai_client.chat.completions.create(
+            model=OPENAI_RESPONSE_MODEL,
+            messages=messages,
+            reasoning_effort=OPENAI_RESPONSE_REASONING_EFFORT,
+            max_completion_tokens=OPENAI_RESPONSE_MAX_COMPLETION_TOKENS,
+            stream=False,
+            timeout=OPENAI_TIMEOUT,
+        )
+    except Exception as exc:
+        logger.exception("Error during response generation.")
+        if probe_mode:
+            return _probe_error_response("generation_failure", "Probe failed during response generation.", details=str(exc))
+        return JSONResponse(
+            status_code=500,
+            content={"response": "Response generation failed. Please try again later.", "sources": [], "id": str(uuid.uuid4())},
+        )
+
+    complete_answer = _extract_completion_text(completion)
+    if not complete_answer or "🛑" in complete_answer:
+        if probe_mode:
+            return _probe_error_response("no_generation_output", "Probe failed because generation returned no usable output.")
+        return JSONResponse(
+            status_code=500,
+            content={"response": "I couldn’t generate a confident answer right now. Try rephrasing your question.", "sources": [], "id": str(uuid.uuid4())},
+        )
+
+    updated_answer, citations = await asyncio.to_thread(process_citations, complete_answer, ranked_docs)
+    chat_str_id = str(uuid.uuid4())
+    try:
+        await ChatRepository.save_chat(request.app.state.pool, question, updated_answer, citations, chat_str_id, RAG_APP_NAME)
+    except Exception as exc:
+        logger.exception(f"Failed to persist telegram response: {exc}")
+
+    response_payload = {"response": updated_answer, "sources": citations, "id": chat_str_id}
+    if probe_mode:
+        response_payload["status"] = "healthy"
+        response_payload["probe"] = True
+    return response_payload
+
+# ------------------------------------------------------------------------------
 # Health check endpoint
 # ------------------------------------------------------------------------------
 @app.get("/", response_class=JSONResponse)
@@ -523,3 +674,86 @@ async def health(request: Request):
             status_code=500,
             content={"status": "error", "message": str(e)}
         )
+
+
+@app.get("/health/generation")
+async def health_generation(request: Request):
+    checks = {
+        "openai": {"status": "healthy", "model": OPENAI_RESPONSE_MODEL},
+        "generation": {"status": "degraded", "error": "probe not executed", "model": OPENAI_RESPONSE_MODEL},
+    }
+
+    pool = request.app.state.pool
+    if not pool or getattr(pool, "closed", False):
+        checks["database"] = {"status": "unhealthy", "error": "Database pool is closed or not initialized"}
+    else:
+        try:
+            async with pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            checks["database"] = {"status": "healthy"}
+        except Exception as exc:
+            checks["database"] = {"status": "unhealthy", "error": str(exc)}
+
+    if not hasattr(request.app.state, "embed_model") or not request.app.state.embed_model:
+        checks["embedding_model"] = {"status": "unhealthy", "error": "Embedding model not initialized"}
+    else:
+        checks["embedding_model"] = {"status": "healthy"}
+
+    if not hasattr(request.app.state, "pinecone_summary_index") or not hasattr(request.app.state, "pinecone_text_index"):
+        checks["vector_store"] = {"status": "unhealthy", "error": "Pinecone indexes not initialized"}
+    else:
+        checks["vector_store"] = {"status": "healthy"}
+
+    preflight_statuses = [checks[k]["status"] for k in ("database", "embedding_model", "vector_store")]
+    if any(status == "unhealthy" for status in preflight_statuses):
+        payload = {
+            "status": "unhealthy",
+            "service": os.getenv("SERVICE_IDENTIFIER", "mbzuai-ug"),
+            "timestamp": _utc_timestamp(),
+            "probe": True,
+            "checks": checks,
+        }
+        return JSONResponse(status_code=503, content=payload)
+
+    try:
+        completion = await openai_client.chat.completions.create(
+            model=OPENAI_RESPONSE_MODEL,
+            messages=[{"role": "user", "content": "Reply with exactly: OK"}],
+            reasoning_effort=OPENAI_RESPONSE_REASONING_EFFORT,
+            max_completion_tokens=32,
+            stream=False,
+            timeout=min(OPENAI_TIMEOUT, 10),
+        )
+        generated_text = _extract_completion_text(completion)
+    except Exception as exc:
+        checks["openai"] = {"status": "unhealthy", "error": str(exc), "model": OPENAI_RESPONSE_MODEL}
+        checks["generation"] = {"status": "unhealthy", "error": str(exc), "model": OPENAI_RESPONSE_MODEL}
+        payload = {
+            "status": "unhealthy",
+            "service": os.getenv("SERVICE_IDENTIFIER", "mbzuai-ug"),
+            "timestamp": _utc_timestamp(),
+            "probe": True,
+            "checks": checks,
+        }
+        return JSONResponse(status_code=503, content=payload)
+
+    if not generated_text:
+        checks["generation"] = {"status": "unhealthy", "error": "generation returned no usable text", "model": OPENAI_RESPONSE_MODEL}
+        payload = {
+            "status": "unhealthy",
+            "service": os.getenv("SERVICE_IDENTIFIER", "mbzuai-ug"),
+            "timestamp": _utc_timestamp(),
+            "probe": True,
+            "checks": checks,
+        }
+        return JSONResponse(status_code=503, content=payload)
+
+    checks["generation"] = {"status": "healthy", "model": OPENAI_RESPONSE_MODEL, "preview": generated_text[:160]}
+    payload = {
+        "status": "healthy",
+        "service": os.getenv("SERVICE_IDENTIFIER", "mbzuai-ug"),
+        "timestamp": _utc_timestamp(),
+        "probe": True,
+        "checks": checks,
+    }
+    return JSONResponse(status_code=200, content=payload)
