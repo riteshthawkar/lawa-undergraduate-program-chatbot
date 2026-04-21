@@ -2,7 +2,12 @@ import json
 import os
 from typing import List, Dict
 from openai import AsyncOpenAI
-from modules.config import logger, OPENAI_TIMEOUT
+from modules.config import (
+    logger,
+    OPENAI_TIMEOUT,
+    OPENAI_QUERY_REWRITER_MODEL,
+    OPENAI_QUERY_REWRITER_REASONING_EFFORT,
+)
 
 # Initialize OpenAI client
 openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -198,13 +203,12 @@ async def query_rewriting_agent(question: str, language: str, message_history: L
 
     try:
         completion = await openai_client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model=OPENAI_QUERY_REWRITER_MODEL,
             messages=[
                 {"role": "system", "content": agent_prompt},
                 {"role": "user", "content": "Analyze this query and provide your analysis in the specified JSON format."}
             ],
-            temperature=0.1,
-            top_p=1,
+            reasoning_effort=OPENAI_QUERY_REWRITER_REASONING_EFFORT,
             response_format={"type": "json_object"},
             timeout=OPENAI_TIMEOUT,
         )

@@ -18,6 +18,8 @@ from modules.config import (
     RERANKER_TOP_N,
     TOTAL_DOCS_TO_RERANK,
     OPENAI_TIMEOUT,
+    OPENAI_RERANKER_MODEL,
+    OPENAI_RERANKER_REASONING_EFFORT,
     HYBRID_ALPHA,
     EMBEDDING_MODEL_NAME,
     BM25_FILE_PATH,
@@ -189,7 +191,7 @@ def get_reranker_system_prompt(is_time_sensitive: bool = False):
 # --- Reranking Function ---
 async def openai_rerank_and_filter_docs(query: str, original_docs: List[Dict[str, Any]], is_time_sensitive: bool = False) -> List[Dict[str, Any]]:
     """
-    Reranks and filters documents using OpenAI's gpt-4o-mini model.
+    Reranks and filters documents using the configured OpenAI reranker model.
     """
     if not original_docs:
         return []
@@ -201,13 +203,13 @@ async def openai_rerank_and_filter_docs(query: str, original_docs: List[Dict[str
     for attempt in range(MAX_RETRIES):
         try:
             response = await client.chat.completions.create(
-                model="gpt-4.1-nano",
+                model=OPENAI_RERANKER_MODEL,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
+                reasoning_effort=OPENAI_RERANKER_REASONING_EFFORT,
                 response_format={"type": "json_object"},
-                temperature=0.0,
                 timeout=OPENAI_TIMEOUT,
             )
             content = response.choices[0].message.content

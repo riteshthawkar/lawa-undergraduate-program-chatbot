@@ -5,13 +5,25 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, BackgroundTasks
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 # Import modules
-from modules.config import logger, validate_env_vars, get_system_prompt, RAG_APP_NAME, OPENAI_TIMEOUT
+from modules.config import (
+    logger,
+    validate_env_vars,
+    get_system_prompt,
+    RAG_APP_NAME,
+    OPENAI_TIMEOUT,
+    OPENAI_RESPONSE_MODEL,
+    OPENAI_RESPONSE_REASONING_EFFORT,
+    OPENAI_RESPONSE_MAX_COMPLETION_TOKENS,
+    OPENAI_CLARIFICATION_MAX_COMPLETION_TOKENS,
+    OPENAI_QUERY_REWRITER_MODEL,
+    OPENAI_RERANKER_MODEL,
+)
 from modules.schemas import ChatRequest
 from modules.utils import safe_send, format_query
 from modules.citations import process_citations
@@ -238,10 +250,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     
                     try:
                         completion = await openai_client.chat.completions.create(
-                            model="chatgpt-4o-latest",
+                            model=OPENAI_RESPONSE_MODEL,
                             messages=messages,
-                            temperature=0,
-                            max_tokens=512,
+                            reasoning_effort=OPENAI_RESPONSE_REASONING_EFFORT,
+                            max_completion_tokens=OPENAI_CLARIFICATION_MAX_COMPLETION_TOKENS,
                             timeout=OPENAI_TIMEOUT,
                         )
                         clarification_response = completion.choices[0].message.content
@@ -322,10 +334,10 @@ async def websocket_endpoint(websocket: WebSocket):
             # Generate and stream the chat response
             try:
                 completion = await openai_client.chat.completions.create(
-                    model="chatgpt-4o-latest",
+                    model=OPENAI_RESPONSE_MODEL,
                     messages=messages,
-                    temperature=0,
-                    max_tokens=1024,
+                    reasoning_effort=OPENAI_RESPONSE_REASONING_EFFORT,
+                    max_completion_tokens=OPENAI_RESPONSE_MAX_COMPLETION_TOKENS,
                     stream=True,
                     timeout=OPENAI_TIMEOUT,
                 )
@@ -443,206 +455,6 @@ async def websocket_endpoint(websocket: WebSocket):
             break
 
 # ------------------------------------------------------------------------------
-# HTTP endpoint for Telegram chat
-# ------------------------------------------------------------------------------
-@app.post("/telegram-chat")
-async def telegram_chat(chat_request: ChatRequest, background_tasks: BackgroundTasks):
-    # Extract the question and language from the validated request body.
-    logger.info(f"Received telegram chat request: {chat_request}")
-    
-    question = chat_request.question
-    language = chat_request.language
-    previous_chats = chat_request.previous_chats
-
-    # Apply query rewriting agent to analyze and possibly rewrite the query
-    agent_result = await query_rewriting_agent(question=question, language=language, message_history=previous_chats)
-    
-    # Handle direct responses (out of scope queries)
-    if agent_result["action"] in ["respond"]:
-        return {
-            "response": agent_result["response"],
-            "sources": []
-        }
-        
-    # The agent returns two specialized queries. Use them for retrieval.
-    metadata_query = agent_result.get("metadata_query", question)
-    natural_language_query = agent_result.get("natural_language_query", question)
-    logger.info(f"Using Metadata Query: '{metadata_query}' and Natural Language Query: '{natural_language_query}'")
-
-    # Use last 5 message-response pairs for context (simple and reliable)
-    relevant_history = []
-    if previous_chats:
-        # Take the last 10 messages (5 pairs) or all if fewer
-        max_messages = min(10, len(previous_chats))
-        relevant_history = previous_chats[-max_messages:]
-        logger.info(f"Using last {len(relevant_history)} messages for context (out of {len(previous_chats)} total)")
-    else:
-        # If no previous chats, use empty history
-        relevant_history = []
-    
-    start_time_retrieval = time.time()
-
-    # Step 3: Fetch initial documents from Pinecone
-    logger.info("Step 3: Fetching documents from Pinecone...")
-    try:
-        docs = await fetch_balanced_documents(
-            rewritten_queries=agent_result.get("rewritten_queries", {}),
-            pinecone_summary_index=app.state.pinecone_summary_index,
-            pinecone_text_index=app.state.pinecone_text_index,
-            embed_model=app.state.embed_model,
-            bm25_encoder=app.state.bm25_encoder
-        )
-        if not docs:
-            logger.warning("No documents found in Pinecone for the query.")
-            # Use main response generation agent to provide intelligent clarification
-            try:
-                # Prepare messages for clarification response
-                messages = [{"role": "system", "content": get_system_prompt()}]
-                messages.extend(relevant_history)
-                messages.append({"role": "user", "content": f"Query: {question}\nLanguage: {language}\n\nI searched our MBZUAI knowledge base but couldn't find relevant documents to answer this question. Please provide an intelligent clarification response that explains what I searched for and asks for specific details to help the user refine their question."})
-                
-                completion = await openai_client.chat.completions.create(
-                    model="chatgpt-4o-latest",
-                    messages=messages,
-                    temperature=0,
-                    max_tokens=512,
-                    timeout=OPENAI_TIMEOUT,
-                )
-                clarification_response = completion.choices[0].message.content
-                
-                # Generate a unique string ID for this chat
-                chat_str_id = str(uuid.uuid4())
-                
-                # Save the clarification response to the database
-                try:
-                    asyncio.create_task(
-                        ChatRepository.save_chat(app.state.pool, question, clarification_response, [], chat_str_id, RAG_APP_NAME)
-                    )
-                except Exception as e:
-                    logger.exception(f"Failed to schedule clarification response save: {e}")
-                
-                return {"response": clarification_response, "sources": [], "id": chat_str_id}
-            except Exception as e:
-                logger.exception("Error generating clarification response:")
-                return {"response": "I couldn't find relevant information and had trouble generating a clarification response. Please try rephrasing your question with more specific details.", "sources": [], "id": str(uuid.uuid4())}
-    except Exception as e:
-        logger.exception("Failed to fetch documents from Pinecone.")
-        return JSONResponse(
-            status_code=500,
-            content={"response": "Something went wrong. Please try again.", "sources": [], "id": str(uuid.uuid4())}
-        )
-
-    end_time_retrieval = time.time()
-    retrieval_time = end_time_retrieval - start_time_retrieval
-    logger.info(f"[PERF] Initial retrieval took {retrieval_time:.4f} seconds.")
-    logger.info(f"Retrieved {len(docs)} documents initially for query: {natural_language_query}")
-
-    # Rerank documents
-    if docs:
-        ranked_docs = await rerank_docs(natural_language_query, docs)
-        logger.info(f"Reranked and received {len(ranked_docs)} documents from rerank_docs.")
-    else:
-        ranked_docs = [] # No docs to rerank
-
-    if not ranked_docs:
-        return {
-            "response": "No relevant information found to answer your question.",
-            "sources": []
-        }
-
-    # Prepare the conversation messages.
-    messages = [{"role": "system", "content": get_system_prompt()}]
-    messages.extend(relevant_history)  # Use only the relevant history
-    messages.append({"role": "user", "content": format_query(question, language, ranked_docs)})
-
-    complete_answer = ""
-    isResponseAvailable = True
-
-    # Generate and stream the chat response.
-    try:
-        completion = await openai_client.chat.completions.create(
-            model="chatgpt-4o-latest",
-            messages=messages,
-            temperature=0,
-            max_tokens=1024,
-            stream=True,
-            timeout=OPENAI_TIMEOUT,
-        )
-        cleaned_answer = ""
-        async for chunk in completion:
-            delta_content = chunk.choices[0].delta.content
-            if delta_content:
-                # Only stop on specific patterns that clearly indicate the LLM wants to stop
-                # Check for the exact phrases from the system prompt that should trigger stopping
-                if ("🛑" in delta_content and 
-                    ("out of my scope" in delta_content.lower() or 
-                     "out of scope" in delta_content.lower() or
-                     "not contain relevant information" in delta_content.lower())):
-                    logger.info(f"Stopping response generation due to scope violation pattern: {delta_content}")
-                    isResponseAvailable = False
-                    break
-                complete_answer += delta_content
-                # Remove inline citation markers from the streamed chunk and store it
-                cleaned_content = re.sub(r'\[\d+\]', '', delta_content)
-                cleaned_answer += cleaned_content
-    except Exception as e:
-        logger.exception("Error during streaming response:")
-        return {
-            "response": "Response generation failed. Please try again later.",
-            "sources": []
-        }
-
-    # If the initial response indicates no answer, return a clear failure message.
-    if not isResponseAvailable:
-        return {
-            "response": "I couldn’t generate a confident answer right now. Try rephrasing with more details (e.g., program, year, topic) or ask a simpler version.",
-            "sources": []
-        }
-
-    # Process citations after streaming completes (run sync function in thread)
-    if isResponseAvailable:
-        updated_answer, citations = await asyncio.to_thread(
-            process_citations, complete_answer, ranked_docs
-        )
-        logger.info(f"Citations after processing (HTTP path): {len(citations)} items")
-    else:
-        # Handle case where no response was generated (e.g., fallback search failed)
-        updated_answer, citations = complete_answer, []
-
-    # Fallback extraction if citations empty but links present (HTTP path)
-    if not citations:
-        try:
-            matches = re.findall(r"\[(\d+)\]\(([^)]+)\)", updated_answer)
-            if matches:
-                seen = set()
-                extracted = []
-                for num, url in matches:
-                    key = (num, url)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    extracted.append({"url": url, "cite_num": str(num)})
-                citations = sorted(extracted, key=lambda x: int(x["cite_num"]))
-                logger.info(f"Extracted {len(citations)} citations from updated answer as fallback (HTTP path).")
-        except Exception as _e:
-            logger.warning(f"Citation fallback extraction failed (HTTP path): {_e}")
-
-    # Generate a unique string ID for this chat
-    chat_str_id = str(uuid.uuid4())
-    
-    # Save chat asynchronously without blocking response
-    try:
-        logger.info(f"Saving chat with {len(citations)} citations (HTTP path)")
-        asyncio.create_task(
-            ChatRepository.save_chat(app.state.pool, question, updated_answer, citations, chat_str_id, RAG_APP_NAME)
-        )
-    except Exception as e:
-        logger.exception(f"Failed to schedule chat save task: {e}")
-
-    # Return the response immediately without waiting for database operation
-    return {"response": updated_answer, "sources": citations, "id": chat_str_id}
-
-# ------------------------------------------------------------------------------
 # Health check endpoint
 # ------------------------------------------------------------------------------
 @app.get("/", response_class=JSONResponse)
@@ -695,7 +507,12 @@ async def health(request: Request):
                 "components": {
                     "embedding_model": "initialized",
                     "pinecone": "connected",
-                    "database": db_status
+                    "database": db_status,
+                    "openai_models": {
+                        "response": OPENAI_RESPONSE_MODEL,
+                        "query_rewriter": OPENAI_QUERY_REWRITER_MODEL,
+                        "reranker": OPENAI_RERANKER_MODEL,
+                    }
                 }
             },
             media_type="application/json"

@@ -37,9 +37,10 @@ lawa-rag-agent/
 3. Set up environment variables by creating a `.env` file:
    ```
    PINECONE_API_KEY=your_pinecone_api_key
-   PERPLEXITY_API_KEY=your_perplexity_api_key
    OPENAI_API_KEY=your_openai_api_key
-   TAVILY_API_KEY=your_tavily_api_key
+   OPENAI_RESPONSE_MODEL=gpt-5.4
+   OPENAI_QUERY_REWRITER_MODEL=gpt-5.4-mini
+   OPENAI_RERANKER_MODEL=gpt-5.4-nano
    ```
 
 4. Run the application:
@@ -47,10 +48,14 @@ lawa-rag-agent/
    uvicorn app:app --reload
    ```
 
+   If `8080` is already in use locally, start on another port:
+   ```
+   PORT=8001 python main.py
+   ```
+
 ## API Endpoints
 
 - WebSocket: `/chat` - For real-time chat interactions
-- HTTP POST: `/telegram-chat` - For Telegram bot integration
 - HTTP GET: `/health` - Health check endpoint
 
 ## Features
@@ -61,4 +66,17 @@ lawa-rag-agent/
 - **Out-of-Scope Detection**: Directly responds to queries outside the system's scope (including Masters/PhD queries)
 - **Clarification Requests**: Asks for more information when queries are ambiguous
 - **Citation Processing**: Extracts and formats citations from responses
-- **Fallback Search**: Uses Tavily search when Pinecone retrieval yields no results 
+- **Fallback Search**: Uses Tavily search when Pinecone retrieval yields no results
+
+## OpenAI Model Defaults
+
+The backend now defaults to the GPT-5.4 family, with env-driven overrides:
+
+- `OPENAI_RESPONSE_MODEL=gpt-5.4`
+- `OPENAI_QUERY_REWRITER_MODEL=gpt-5.4-mini`
+- `OPENAI_RERANKER_MODEL=gpt-5.4-nano`
+- `OPENAI_RESPONSE_REASONING_EFFORT=low`
+- `OPENAI_RESPONSE_MAX_COMPLETION_TOKENS=4096`
+- `OPENAI_CLARIFICATION_MAX_COMPLETION_TOKENS=1024`
+- `OPENAI_QUERY_REWRITER_REASONING_EFFORT=low`
+- `OPENAI_RERANKER_REASONING_EFFORT=low`

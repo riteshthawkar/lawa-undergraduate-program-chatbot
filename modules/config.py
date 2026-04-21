@@ -41,6 +41,18 @@ TOTAL_DOCS_TO_RERANK = int(os.getenv("TOTAL_DOCS_TO_RERANK", 20))
 # OpenAI request timeout (seconds)
 OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "30"))
 
+# OpenAI model defaults follow the current GPT-5.4 guidance:
+# flagship generation on gpt-5.4, lightweight agents on gpt-5.4-mini,
+# and high-volume ranking/classification on gpt-5.4-nano.
+OPENAI_RESPONSE_MODEL = os.getenv("OPENAI_RESPONSE_MODEL", "gpt-5.4")
+OPENAI_RESPONSE_REASONING_EFFORT = os.getenv("OPENAI_RESPONSE_REASONING_EFFORT", "low")
+OPENAI_RESPONSE_MAX_COMPLETION_TOKENS = int(os.getenv("OPENAI_RESPONSE_MAX_COMPLETION_TOKENS", "4096"))
+OPENAI_CLARIFICATION_MAX_COMPLETION_TOKENS = int(os.getenv("OPENAI_CLARIFICATION_MAX_COMPLETION_TOKENS", "1024"))
+OPENAI_QUERY_REWRITER_MODEL = os.getenv("OPENAI_QUERY_REWRITER_MODEL", "gpt-5.4-mini")
+OPENAI_QUERY_REWRITER_REASONING_EFFORT = os.getenv("OPENAI_QUERY_REWRITER_REASONING_EFFORT", "low")
+OPENAI_RERANKER_MODEL = os.getenv("OPENAI_RERANKER_MODEL", "gpt-5.4-nano")
+OPENAI_RERANKER_REASONING_EFFORT = os.getenv("OPENAI_RERANKER_REASONING_EFFORT", "low")
+
 # Hybrid search weighting and embedding model configuration
 HYBRID_ALPHA = float(os.getenv("HYBRID_ALPHA", "0.5"))
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "Qwen/Qwen3-Embedding-0.6B")
